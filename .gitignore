@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+3D_FDTD_Dipole_in_free_space.py
+
+# CODE outputs and data
+results/
+dataset/
+cervical_dataset/
+BC_MRI_SEG/
+3D_FDTD_D
+
+# Env and OS
+.env
+.env.*
+.DS_Store
+*.log
