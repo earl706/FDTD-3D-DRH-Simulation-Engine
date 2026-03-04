@@ -7,6 +7,7 @@ __pycache__/
 3D_FDTD_Dipole_in_free_space.py
 
 # CODE outputs and data
+checkpoint_epoch_8.pth
 results/
 dataset/
 cervical_dataset/
