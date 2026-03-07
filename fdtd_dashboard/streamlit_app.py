@@ -787,6 +787,7 @@ def _build_engine_argv(
         return None
     argv.extend(["--time-steps", str(time_steps)])
     argv.extend(["--max-dim", str(max_dim)])
+    argv.append("--stream-frames")
     if optimize_antenna:
         argv.append("--optimize-antenna")
         argv.extend(["--f0", str(f0_hz)])
@@ -810,6 +811,109 @@ def _build_engine_argv(
     else:
         argv.extend(["--pulse-amplitude", str(pulse_amplitude)])
     return argv
+
+
+def _build_run_config(
+    seg_path_saved,
+    modalities_dir_saved,
+    checkpoint_path,
+    no_normal_brain,
+    optimize_antenna,
+    f0_hz,
+    opt_time_steps,
+    opt_phase_steps,
+    opt_amp_steps,
+    opt_amp_min,
+    opt_amp_max,
+    opt_refine_iters,
+    opt_multi_start,
+    opt_penalty_weight,
+    opt_freq_sweep,
+    opt_geom_offsets,
+    opt_geom_zplanes,
+    pulse_amplitude,
+    time_steps,
+    max_dim,
+):
+    """Build a JSON-serializable config dict for the local runner.
+    Paths are relative to run package root: seg_path as 'input/seg.nii.gz', modalities_dir as 'input'.
+    """
+    if modalities_dir_saved is not None:
+        input_mode = "modalities_dir"
+        seg_path_rel = None
+        modalities_dir_rel = "input"
+    elif seg_path_saved is not None:
+        input_mode = "seg"
+        seg_path_rel = "input/" + Path(seg_path_saved).name
+        modalities_dir_rel = None
+    else:
+        return None
+
+    config = {
+        "input_mode": input_mode,
+        "seg_path": seg_path_rel,
+        "modalities_dir": modalities_dir_rel,
+        "checkpoint": Path(checkpoint_path).name if checkpoint_path else None,
+        "no_normal_brain": bool(no_normal_brain),
+        "optimize_antenna": bool(optimize_antenna),
+        "f0_hz": float(f0_hz),
+        "opt_time_steps": int(opt_time_steps),
+        "opt_phase_steps": int(opt_phase_steps),
+        "opt_amp_steps": int(opt_amp_steps),
+        "opt_amp_min": float(opt_amp_min),
+        "opt_amp_max": float(opt_amp_max),
+        "opt_refine_iters": int(opt_refine_iters),
+        "opt_multi_start": int(opt_multi_start),
+        "opt_penalty_weight": float(opt_penalty_weight),
+        "opt_freq_sweep": opt_freq_sweep,
+        "opt_geom_offsets": opt_geom_offsets,
+        "opt_geom_zplanes": opt_geom_zplanes,
+        "pulse_amplitude": float(pulse_amplitude),
+        "time_steps": int(time_steps),
+        "max_dim": int(max_dim),
+    }
+    return config
+
+
+def _make_run_local_html(config_json_str):
+    """Return HTML string for run_local.html: form with run_package_dir input and Run button that POSTs config to localhost:8765."""
+    # Embed JSON in a script block; escape </ so it doesn't close a script tag
+    safe_json = config_json_str.replace("</", "<\\/")
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Run simulation locally</title></head>
+<body>
+  <h1>Run FDTD on your machine</h1>
+  <p>1. Start the local runner: <code>python fdtd_dashboard/local_runner.py</code> (from repo root).</p>
+  <p>2. Extract the run package ZIP you downloaded.</p>
+  <p>3. Enter the path to the extracted folder below, then click Run.</p>
+  <label>Path to extracted run package folder: <input type="text" id="run_package_dir" size="60" placeholder="e.g. /Users/me/Downloads/run_20250101_120000" /></label>
+  <br><br>
+  <button id="runBtn">Run simulation on my machine</button>
+  <pre id="out"></pre>
+  <script type="application/json" id="run-config">{safe_json}</script>
+  <script>
+    var config = JSON.parse(document.getElementById("run-config").textContent);
+    document.getElementById("runBtn").onclick = function () {{
+      var dir = document.getElementById("run_package_dir").value.trim();
+      if (!dir) {{ document.getElementById("out").textContent = "Please enter the path to the extracted run package folder."; return; }}
+      var payload = Object.assign({{}}, config, {{ run_package_dir: dir }});
+      document.getElementById("out").textContent = "Sending to local runner...";
+      fetch("http://127.0.0.1:8765/run", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload)
+      }})
+      .then(function (r) {{ return r.json().then(function (j) {{ return {{ ok: r.ok, body: j }}; }}); }})
+      .then(function (x) {{
+        if (x.ok) document.getElementById("out").textContent = "Started (PID " + x.body.pid + "). Check the runner terminal and results/ folder.";
+        else document.getElementById("out").textContent = "Error: " + (x.body.error || JSON.stringify(x.body));
+      }})
+      .catch(function (e) {{ document.getElementById("out").textContent = "Request failed: " + e; }});
+    }};
+  </script>
+</body>
+</html>"""
 
 
 def render_run_simulation():
@@ -1046,6 +1150,19 @@ def render_run_simulation():
         _parse_int_list(opt_geom_zplanes_str) if optimize_antenna else None
     )
 
+    st.divider()
+    run_where = st.radio(
+        "Where to run the simulation",
+        ["Server (this machine)", "My machine (local runner)"],
+        key="run_where",
+        help="Server: run here (Streamlit Cloud or your server). My machine: prepare a run package and use a local runner so the simulation runs on your PC.",
+    )
+    run_on_my_machine = run_where == "My machine (local runner)"
+    if run_on_my_machine:
+        st.info(
+            "You will download a run package and a Run page. Start the local runner on your PC, then use the Run page to start the simulation. No FDTD runs on this server."
+        )
+
     run_clicked = st.button("Run simulation", type="primary", key="run_sim_btn")
     if run_clicked:
         can_run = (
@@ -1103,54 +1220,115 @@ def render_run_simulation():
                         if key:
                             (run_upload_dir / f"{key}.nii").write_bytes(u.getvalue())
                     modalities_dir_saved = run_upload_dir
-            argv = _build_engine_argv(
-                repo_root,
-                seg_path=seg_path_saved,
-                modalities_dir=(
-                    str(modalities_dir_saved) if modalities_dir_saved else None
-                ),
-                checkpoint=checkpoint_path or None,
-                no_normal_brain=no_normal_brain,
-                optimize_antenna=optimize_antenna,
-                f0_hz=f0_hz,
-                opt_time_steps=opt_time_steps,
-                opt_phase_steps=opt_phase_steps,
-                opt_amp_steps=opt_amp_steps,
-                opt_amp_min=opt_amp_min,
-                opt_amp_max=opt_amp_max,
-                opt_refine_iters=opt_refine_iters,
-                opt_multi_start=opt_multi_start,
-                opt_penalty_weight=opt_penalty_weight,
-                opt_freq_sweep=opt_freq_sweep,
-                opt_geom_offsets=opt_geom_offsets,
-                opt_geom_zplanes=opt_geom_zplanes,
-                pulse_amplitude=pulse_amplitude,
-                time_steps=time_steps,
-                max_dim=max_dim,
-            )
-            if argv is None:
-                st.error(
-                    "Invalid input: provide either segmentation path or modalities directory."
+            if run_on_my_machine:
+                # Build run package (config + input/) and Run page for local execution
+                run_config = _build_run_config(
+                    seg_path_saved,
+                    modalities_dir_saved,
+                    checkpoint_path or None,
+                    no_normal_brain,
+                    optimize_antenna,
+                    f0_hz,
+                    opt_time_steps,
+                    opt_phase_steps,
+                    opt_amp_steps,
+                    opt_amp_min,
+                    opt_amp_max,
+                    opt_refine_iters,
+                    opt_multi_start,
+                    opt_penalty_weight,
+                    opt_freq_sweep,
+                    opt_geom_offsets,
+                    opt_geom_zplanes,
+                    pulse_amplitude,
+                    time_steps,
+                    max_dim,
                 )
-            else:
-                log_path = get_results_root() / "uploads" / "last_run.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_path, "w") as logf:
-                    proc = subprocess.Popen(
-                        argv,
-                        cwd=str(repo_root),
-                        stdout=logf,
-                        stderr=subprocess.STDOUT,
+                if run_config is None:
+                    st.error(
+                        "Invalid input: provide either segmentation path or modalities directory."
                     )
-                if "run_sim_pid" not in st.session_state:
-                    st.session_state["run_sim_pid"] = None
-                st.session_state["run_sim_pid"] = proc.pid
-                st.session_state["run_sim_log_path"] = str(log_path)
-                st.success(
-                    f"Simulation started (PID {proc.pid}). Output will appear under `results/`. "
-                    "Refresh the page or run list to see the new run when it finishes."
+                else:
+                    import io as _io
+
+                    config_json_str = json.dumps(run_config, indent=2)
+                    zip_buffer = _io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr("run_config.json", config_json_str)
+                        for f in run_upload_dir.iterdir():
+                            if f.is_file():
+                                zf.write(f, "input/" + f.name)
+                    zip_buffer.seek(0)
+                    run_local_html = _make_run_local_html(config_json_str)
+
+                    st.success("Run package ready. Download both items below, then follow the steps on the Run page.")
+                    st.markdown("**Steps:** 1) Start the local runner on your PC: `python fdtd_dashboard/local_runner.py` (from repo root). 2) Download and extract the run package ZIP. 3) Download and open the Run page (HTML). 4) Enter the path to the extracted folder and click Run.")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button(
+                            "Download run package (ZIP)",
+                            data=zip_buffer.getvalue(),
+                            file_name=f"run_package_{run_id}.zip",
+                            mime="application/zip",
+                            key="dl_run_package",
+                        )
+                    with col2:
+                        st.download_button(
+                            "Download Run page (HTML)",
+                            data=run_local_html,
+                            file_name="run_local.html",
+                            mime="text/html",
+                            key="dl_run_local_html",
+                        )
+            else:
+                argv = _build_engine_argv(
+                    repo_root,
+                    seg_path=seg_path_saved,
+                    modalities_dir=(
+                        str(modalities_dir_saved) if modalities_dir_saved else None
+                    ),
+                    checkpoint=checkpoint_path or None,
+                    no_normal_brain=no_normal_brain,
+                    optimize_antenna=optimize_antenna,
+                    f0_hz=f0_hz,
+                    opt_time_steps=opt_time_steps,
+                    opt_phase_steps=opt_phase_steps,
+                    opt_amp_steps=opt_amp_steps,
+                    opt_amp_min=opt_amp_min,
+                    opt_amp_max=opt_amp_max,
+                    opt_refine_iters=opt_refine_iters,
+                    opt_multi_start=opt_multi_start,
+                    opt_penalty_weight=opt_penalty_weight,
+                    opt_freq_sweep=opt_freq_sweep,
+                    opt_geom_offsets=opt_geom_offsets,
+                    opt_geom_zplanes=opt_geom_zplanes,
+                    pulse_amplitude=pulse_amplitude,
+                    time_steps=time_steps,
+                    max_dim=max_dim,
                 )
-                st.caption(f"Log: `{log_path}`")
+                if argv is None:
+                    st.error(
+                        "Invalid input: provide either segmentation path or modalities directory."
+                    )
+                else:
+                    log_path = get_results_root() / "uploads" / "last_run.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "w") as logf:
+                        proc = subprocess.Popen(
+                            argv,
+                            cwd=str(repo_root),
+                            stdout=logf,
+                            stderr=subprocess.STDOUT,
+                        )
+                    if "run_sim_pid" not in st.session_state:
+                        st.session_state["run_sim_pid"] = None
+                    st.session_state["run_sim_pid"] = proc.pid
+                    st.session_state["run_sim_log_path"] = str(log_path)
+                    st.success(
+                        f"Simulation started (PID {proc.pid}). Output will appear under `results/`. "
+                        "Refresh the page or run list to see the new run when it finishes."
+                    )
+                    st.caption(f"Log: `{log_path}`")
 
     # Live progress (fragment reruns every 3s so progress updates without manual refresh)
     st.divider()

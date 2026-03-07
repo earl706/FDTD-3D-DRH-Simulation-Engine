@@ -542,6 +542,168 @@ def create_ten_slice_preview(volume_4d, segmentation_3d, slice_indices, save_pat
     return fig
 
 
+def create_3x15_tumor_previews(
+    volume_4d,
+    segmentation_3d,
+    sar_3d,
+    temperature_3d,
+    output_dir,
+    case_name="case",
+    n_slices=15,
+):
+    """
+    Create three 3x5 grid preview images for axial slices with largest tumor area:
+    (1) FLAIR + segmentation overlay, (2) SAR, (3) Temperature.
+    Saves one PNG per modality to output_dir.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Ensure spatial shapes are compatible
+    H, W, D = segmentation_3d.shape
+    if volume_4d.shape[1:] != (H, W, D):
+        raise ValueError(
+            f"volume_4d spatial shape {volume_4d.shape[1:]} "
+            f"does not match segmentation_3d shape {segmentation_3d.shape}"
+        )
+    if sar_3d.shape != (H, W, D) or temperature_3d.shape != (H, W, D):
+        raise ValueError(
+            "sar_3d and temperature_3d must have shape (H, W, D) "
+            f"matching segmentation_3d; got {sar_3d.shape}, {temperature_3d.shape}"
+        )
+
+    # Select axial slices (axis=2) with largest tumor area
+    top_indices = select_slices_biggest_tumor(
+        segmentation_3d, n_slices=n_slices, axis=2
+    )
+    if not top_indices:
+        return
+
+    top_indices = [z for z in top_indices if 0 <= z < D][:n_slices]
+    if not top_indices:
+        return
+
+    n_show = len(top_indices)
+    nrows, ncols = 3, 5
+
+    def _make_flair_seg_grid():
+        flair_vol = volume_4d[0]
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+        axes = np.atleast_2d(axes)
+        for idx, z in enumerate(top_indices[: nrows * ncols]):
+            row, col = idx // ncols, idx % ncols
+            flair = flair_vol[:, :, z]
+            seg_slice = segmentation_3d[:, :, z]
+            seg_rgb = _seg_to_rgb_preview(seg_slice)
+            base = (flair - flair.min()) / (flair.max() - flair.min() + 1e-8)
+            base = np.clip(base, 0, 1)
+            base_rgb = np.stack([base] * 3, axis=-1)
+            overlay = np.clip(0.5 * base_rgb + 0.5 * seg_rgb, 0, 1)
+            axes[row, col].imshow(overlay, origin="lower")
+            axes[row, col].set_title(f"z={z}", fontsize=10)
+            axes[row, col].axis("off")
+        for idx in range(n_show, nrows * ncols):
+            row, col = idx // ncols, idx % ncols
+            axes[row, col].axis("off")
+        fig.suptitle(
+            f"{case_name} — FLAIR + segmentation (top {n_show} slices by tumor area)",
+            fontsize=12,
+        )
+        plt.tight_layout()
+        fig.savefig(
+            os.path.join(
+                output_dir, f"{case_name}_tumor_preview_flair_segmentation.png"
+            ),
+            dpi=100,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    def _make_scalar_grid(
+        volume_3d, title_prefix, filename_suffix, cmap, vmin_phys, vmax_phys, cbar_label
+    ):
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+        axes = np.atleast_2d(axes)
+        im = None
+        for idx, z in enumerate(top_indices[: nrows * ncols]):
+            row, col = idx // ncols, idx % ncols
+            img_slice = volume_3d[:, :, z]
+            # Per-slice contrast: robustly normalize this slice to [0, 1]
+            if np.any(np.isfinite(img_slice)):
+                lo, hi = np.nanpercentile(img_slice, [1, 99])
+                if hi > lo:
+                    img_slice = (img_slice - lo) / (hi - lo)
+            img_slice = np.clip(img_slice, 0.0, 1.0)
+            im = axes[row, col].imshow(
+                img_slice, cmap=cmap, origin="lower", vmin=0.0, vmax=1.0
+            )
+            axes[row, col].set_title(f"z={z}", fontsize=10)
+            axes[row, col].axis("off")
+        for idx in range(n_show, nrows * ncols):
+            row, col = idx // ncols, idx % ncols
+            axes[row, col].axis("off")
+        fig.suptitle(
+            f"{case_name} — {title_prefix} (top {n_show} slices by tumor area)",
+            fontsize=12,
+        )
+        # Layout subplots, leaving room on the right for a shared colorbar
+        fig.tight_layout(rect=[0.0, 0.0, 0.9, 1.0])
+
+        if im is not None:
+            # Colorbar in real physical units, even though images are slice-normalized.
+            # We map normalized [0,1] tick positions back to [vmin_phys, vmax_phys].
+            cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+            cbar = fig.colorbar(im, cax=cax)
+            n_ticks = 5
+            tick_positions = np.linspace(0.0, 1.0, n_ticks)
+            tick_values = np.linspace(vmin_phys, vmax_phys, n_ticks)
+            cbar.set_ticks(tick_positions)
+            # Show full numeric precision (up to 5 decimal places)
+            cbar.set_ticklabels([f"{v:.5f}" for v in tick_values])
+            cbar.set_label(cbar_label)
+
+        fig.savefig(
+            os.path.join(output_dir, f"{case_name}_distribution_{filename_suffix}.png"),
+            dpi=100,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    _make_flair_seg_grid()
+
+    # Match FDTD per-slice panels: use the same global magnitude ranges
+    # SAR: vmin=0, vmax=max(SAR) (see fdtd_brain_simulation_engine.py:4512-4515)
+    sar_max = float(np.max(sar_3d)) if np.max(sar_3d) > 0 else 1.0
+    _make_scalar_grid(
+        sar_3d,
+        "SAR",
+        "sar",
+        cmap="inferno",
+        vmin_phys=0.0,
+        vmax_phys=sar_max,
+        cbar_label="SAR (W/kg)",
+    )
+
+    # Temperature: vmin=min(T), vmax=max(T) (see fdtd_brain_simulation_engine.py:4530-4540)
+    T_min = float(np.min(temperature_3d))
+    T_max = float(np.max(temperature_3d))
+    if T_max <= T_min:
+        T_max = T_min + 0.1
+    _make_scalar_grid(
+        temperature_3d,
+        "Temperature",
+        "temperature",
+        cmap="coolwarm",
+        vmin_phys=T_min,
+        vmax_phys=T_max,
+        cbar_label="T (°C)",
+    )
+
+
 # Label for non-tumor brain tissue (used when extend_with_normal_brain=True)
 LABEL_NORMAL_BRAIN = 4
 

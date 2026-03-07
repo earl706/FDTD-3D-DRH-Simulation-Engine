@@ -1808,15 +1808,23 @@ parser.add_argument(
 parser.add_argument(
     "--stream-frames",
     action="store_true",
-    help="Stream E and SAR frames to disk during FDTD instead of keeping in memory. "
+    default=True,
+    dest="stream_frames",
+    help="Stream E and SAR frames to disk during FDTD instead of keeping in memory (default: True). "
     "Use with --stream-frame-interval to control density. Enables full (or dense) timestep "
     "saving without OOM; animations can be built separately from saved frames.",
+)
+parser.add_argument(
+    "--no-stream-frames",
+    action="store_false",
+    dest="stream_frames",
+    help="Keep E and SAR frames in memory instead of streaming to disk (disables default streaming).",
 )
 parser.add_argument(
     "--stream-frame-interval",
     type=int,
     default=1,
-    help="Save a frame every N timesteps when --stream-frames is set (default: 1 = every step).",
+    help="Save a frame every N timesteps when streaming (default: 1 = every step).",
 )
 parser.add_argument(
     "--skip-animations",
@@ -1965,6 +1973,7 @@ if __name__ == "__main__":
     use_modalities = (modality_paths is not None) or (args.modalities_dir is not None)
     t_start_pipeline = time.perf_counter()
     t_start_segmentation = t_start_pipeline
+    volume_4d_ds = None  # downsampled modalities, used for previews when available
     if use_modalities:
         if args.modalities_dir is not None:
             flair_path, t1_path, t1ce_path, t2_path = _find_modalities_in_dir(
@@ -4511,7 +4520,7 @@ if __name__ == "__main__":
         # Panel 2: SAR
         sar_max_k = np.max(SAR) if np.max(SAR) > 0 else 1.0
         im_sar = ax_sar.imshow(
-            SAR[:, :, k], origin="lower", cmap="inferno", vmin=0, vmax=sar_max_k
+            SAR[:, :, k], origin="lower", cmap="gray", vmin=0, vmax=sar_max_k
         )
         ax_sar.set_title(f"SAR axial (z={k})")
         ax_sar.set_xlabel("Y (cells)")
@@ -4565,6 +4574,36 @@ if __name__ == "__main__":
     print(
         f"  Saved {len(top_10_slice_indices)} side-by-side anatomy/SAR/temperature figures to {IMAGES_DIR}/"
     )
+
+    # ----- 3x15 tumor previews: FLAIR+segmentation, SAR, Temperature (top 15 slices) -----
+    if use_modalities and volume_4d_ds is not None:
+        try:
+            from brain_tumor_segmentation_model import create_3x15_tumor_previews
+        except ImportError:
+            create_3x15_tumor_previews = None
+
+        if create_3x15_tumor_previews is not None:
+            print(
+                "\nSaving 3x15 tumor previews (FLAIR+segmentation, SAR, Temperature) for top slices..."
+            )
+            # Use the steady-state SAR and temperature fields as 3D volumes
+            sar_3d = SAR
+            temperature_3d = T_temp
+            try:
+                create_3x15_tumor_previews(
+                    volume_4d_ds,
+                    labels_3d,
+                    sar_3d,
+                    temperature_3d,
+                    output_dir=IMAGES_DIR,
+                    case_name=OUTPUT_BASE,
+                    n_slices=15,
+                )
+                print(
+                    f"  Saved 3x15 grid previews (FLAIR+seg, SAR, Temperature) to {IMAGES_DIR}/"
+                )
+            except Exception as e:
+                print(f"  Warning: failed to create 3x15 tumor previews: {e}")
 
     # Function to prepare 3D voxel data for a frame
     def prepare_3d_voxel_data(data, step=3, threshold_ratio=0.3):

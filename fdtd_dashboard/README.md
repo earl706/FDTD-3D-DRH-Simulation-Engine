@@ -43,6 +43,19 @@ Then open the URL shown (e.g. http://localhost:8501).
 - **Scalability**: Scatter plots of wall time and peak memory vs voxels across runs.
 - **Data preview**: Optional NIfTI slice view for SAR and temperature (if files exist).
 
+## Run simulation on your machine (no server compute)
+
+When the app is deployed (e.g. Streamlit Cloud), you can run the FDTD simulation on your own PC so the server does not run the engine:
+
+1. In the **Run simulation** tab, choose **"My machine (local runner)"**.
+2. Configure inputs and parameters as usual, then click **Run simulation**.
+3. Download the **run package (ZIP)** and the **Run page (HTML)**.
+4. On your PC, from the repo root: `python fdtd_dashboard/local_runner.py`
+5. Extract the ZIP and open the downloaded HTML in your browser.
+6. Enter the path to the extracted folder and click **Run simulation on my machine**.
+
+The browser sends the run config to the local runner (localhost:8765), which starts `fdtd_brain_simulation_engine.py` on your machine. Results appear under `results/` locally.
+
 ## Data layout
 
 The app expects:
