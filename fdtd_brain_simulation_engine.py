@@ -59,36 +59,86 @@ CLI arguments:
       Penalty weight for healthy P95 SAR hotspot in objective (default: 0.1).
   --opt-source-scale S
       Global scale for optimized source in final FDTD run; SAR scales with S² (default: 1.0).
+  --opt-parallel N
+      Parallel workers for antenna optimization (frequency/geometry sweep, multi-start). Default: 1.
   --stream-frames
       Stream E and SAR frames to disk during FDTD (no in-memory accumulation). Use with
       --stream-frame-interval for full or dense timesteps; build animations separately from saved frames.
       After the run, build_animations_from_streamed_frames.py is invoked to build MP4s; use --slice-timestep-images to also generate per-(slice, timestep) PNGs (E/SAR/T) for the dashboard.
+  --no-stream-frames
+      Keep E and SAR frames in memory instead of streaming to disk (disables default streaming).
   --stream-frame-interval N
       Save a frame every N timesteps when --stream-frames (default: 1 = every step).
+  --skip-animations
+      Do not build or save MP4 animations; frames are still saved. Use build_animations_from_streamed_frames.py later.
   --slice-timestep-images
       When using --stream-frames: generate per-(slice, timestep) PNGs for the dashboard (skipped by default).
 
   Standard run (pulse types: gaussian, sinusoid, sinusoid_no_ramp, modulated_gaussian, cw):
+  --time-steps N
+      FDTD time steps for standard run (default: 500). Ignored when --optimize-antenna.
+  --max-dim N
+      Maximum grid dimension; segmentation downsampled if larger (default: 120).
+  --pulse-type TYPE
+      Source waveform: gaussian, cw, modulated_gaussian, sinusoid, sinusoid_no_ramp (default: gaussian).
+  --prop-direction DIR
+      Plane-wave direction for gaussian/modulated_gaussian: +x, -x, +y, -y, +z, -z (default: +y).
+  --source-x, --source-y, --source-z
+      Grid indices for point source 1 (default: grid center). For cw/sinusoid/sinusoid_no_ramp.
   --pulse-amplitude A
       Amplitude of the source pulse (default: 100). SAR and temperature scale with A².
+  --pulse-freq FREQ
+      Frequency in Hz for modulated_gaussian, sinusoid, sinusoid_no_ramp, cw (default: 100e6).
+  --cw-periods N
+      For cw/sinusoid_no_ramp: set time_steps to N periods, SAR from period 10. Unset: cw/sinusoid use min 15 periods.
+  --pulse-ramp-width N
+      Gaussian ramp-up width (time steps) for CW and sinusoid soft start (default: 30). Ignored for sinusoid_no_ramp.
   --use-source-2, --use-source-3
-      Enable 2nd/3rd point source at antenna-like positions (cw/sinusoid/sinusoid_no_ramp). Use --source-x-2 etc. to override.
+      Enable 2nd/3rd point source at antenna-like positions (cw/sinusoid/sinusoid_no_ramp).
+  --source-x-2, --source-y-2, --source-z-2
+      Grid indices for second point source (when --use-source-2). Default: antenna-like position.
+  --source-x-3, --source-y-3, --source-z-3
+      Grid indices for third point source (when --use-source-3). Default: antenna-like position.
+  --source-ring-offset N
+      Cells from boundary for default antenna-like positions of source 2/3 (default: 10).
+
+  Grid resolution:
+  --dx-mm MM
+      Grid resolution (voxel size) in mm (default: 10). Stored in meters for FDTD, SAR, thermal solver, and NIfTI affine.
+      Paper recommends 1–5 mm for anatomical detail; default 10 mm preserves backward compatibility.
+  --courant-factor F
+      Safety factor for time step: dt = F * dt_courant, where dt_courant follows the Courant stability condition (paper Sec. 3.2). Default: 0.99.
 
 Input: BraTS-style segmentation (0=background, 1=necrotic, 2=edema, 3=enhancing; optional 4=normal brain).
-Output: results/{timestamp}/{data|images|animations}/{base}_*.png, *.mp4, *.npy, *.json
+Output: results/{timestamp}/{data|images|animations}/{base}_*.png, *.mp4, *.npy, *.json.
+  Performance and scalability JSONs include a ``backend`` field (e.g. ``numpy_numba``).
 
 When using --modalities, segmentation is performed by the 3D U-Net from
 BrainTumorSegmentation-3DUNet-StreamlitApp (Apache License 2.0). See
 brain_tumor_segmentation_model.py for attribution.
+
+Benchmark mode (Objective 5 scalability):
+  --benchmark-grid-sizes N [N ...]
+      Run minimal FDTD-only for each grid size N³, collect timing and memory, write scalability JSON.
+  --benchmark-grid-sizes-range A B S
+      Grid sizes as range: min A, max B, step S (e.g. 50 200 50 → 50,100,150,200). Alternative to --benchmark-grid-sizes.
+  --benchmark-time-steps N
+      FDTD time steps per benchmark run (default: 500).
 """
+
+# Benchmark config (Objective 5: performance evaluation)
+BENCHMARK_GRID_SIZES_DEFAULT = [100, 200, 300]
+BENCHMARK_TIME_STEPS_DEFAULT = 500
 
 from math import exp, sqrt, cos, sin
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import glob
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 import numba
@@ -119,6 +169,126 @@ def _get_peak_memory_mb():
         return rss / 1024.0  # Linux: KB -> MB
     except Exception:
         return None
+
+
+def _run_minimal_fdtd_benchmark(
+    nx, ny, nz, time_steps, dx_mm=10.0, courant_factor=0.99
+):
+    """
+    Run a minimal FDTD-only loop (air, no source) for scalability benchmarking.
+    Returns dict with grid_shape, number_of_voxels, time_steps, total_wall_time_s,
+    time_per_step_ms, peak_memory_MB for inclusion in scalability JSON.
+    """
+    dx = dx_mm * 1e-3
+    c_light = 2.99792458e8
+    dy = dz = dx
+    dt_courant = 1.0 / (
+        c_light * sqrt(1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz))
+    )
+    dt = courant_factor * dt_courant
+    npml = max(4, min(16, min(nx, ny, nz) // 10))
+    (
+        gi1,
+        gi2,
+        gi3,
+        fi1,
+        fi2,
+        fi3,
+        gj1,
+        gj2,
+        gj3,
+        fj1,
+        fj2,
+        fj3,
+        gk1,
+        gk2,
+        gk3,
+        fk1,
+        fk2,
+        fk3,
+    ) = calculate_pml_parameters(npml, nx, ny, nz)
+    # Air: eps_r=1, sigma=0 -> eps = 1, conductivity = 0
+    eps_x = np.ones((nx, ny, nz))
+    eps_y = np.ones((nx, ny, nz))
+    eps_z = np.ones((nx, ny, nz))
+    conductivity_x = np.zeros((nx, ny, nz))
+    conductivity_y = np.zeros((nx, ny, nz))
+    conductivity_z = np.zeros((nx, ny, nz))
+    Dx = np.zeros((nx, ny, nz))
+    Dy = np.zeros((nx, ny, nz))
+    Dz = np.zeros((nx, ny, nz))
+    iDx = np.zeros((nx, ny, nz))
+    iDy = np.zeros((nx, ny, nz))
+    iDz = np.zeros((nx, ny, nz))
+    Ex = np.zeros((nx, ny, nz))
+    Ey = np.zeros((nx, ny, nz))
+    Ez = np.zeros((nx, ny, nz))
+    Ix = np.zeros((nx, ny, nz))
+    Iy = np.zeros((nx, ny, nz))
+    Iz = np.zeros((nx, ny, nz))
+    Hx = np.zeros((nx, ny, nz))
+    Hy = np.zeros((nx, ny, nz))
+    Hz = np.zeros((nx, ny, nz))
+    iHx = np.zeros((nx, ny, nz))
+    iHy = np.zeros((nx, ny, nz))
+    iHz = np.zeros((nx, ny, nz))
+    t0 = time.perf_counter()
+    for _ in range(1, time_steps + 1):
+        Dx, iDx = calculate_dx_field(
+            nx, ny, nz, Dx, iDx, Hy, Hz, gj3, gk3, gj2, gk2, gi1
+        )
+        Dy, iDy = calculate_dy_field(
+            nx, ny, nz, Dy, iDy, Hx, Hz, gi3, gk3, gi2, gk2, gj1
+        )
+        Dz, iDz = calculate_dz_field(
+            nx, ny, nz, Dz, iDz, Hx, Hy, gi3, gj3, gi2, gj2, gk1
+        )
+        Ex, Ey, Ez, Ix, Iy, Iz = calculate_e_fields(
+            nx,
+            ny,
+            nz,
+            Dx,
+            Dy,
+            Dz,
+            eps_x,
+            eps_y,
+            eps_z,
+            conductivity_x,
+            conductivity_y,
+            conductivity_z,
+            Ex,
+            Ey,
+            Ez,
+            Ix,
+            Iy,
+            Iz,
+        )
+        Hx, iHx = calculate_hx_field(
+            nx, ny, nz, Hx, iHx, Ey, Ez, fi1, fj2, fk2, fj3, fk3
+        )
+        Hy, iHy = calculate_hy_field(
+            nx, ny, nz, Hy, iHy, Ex, Ez, fj1, fi2, fk2, fi3, fk3
+        )
+        Hz, iHz = calculate_hz_field(
+            nx, ny, nz, Hz, iHz, Ex, Ey, fk1, fi2, fj2, fi3, fj3
+        )
+    t1 = time.perf_counter()
+    total_wall_time_s = t1 - t0
+    time_per_step_ms = 1000.0 * total_wall_time_s / time_steps if time_steps else None
+    number_of_voxels = nx * ny * nz
+    peak_memory_MB = _get_peak_memory_mb()
+    return {
+        "grid_shape": [nx, ny, nz],
+        "number_of_voxels": number_of_voxels,
+        "time_steps": time_steps,
+        "total_wall_time_s": round(total_wall_time_s, 6),
+        "time_per_step_ms": (
+            round(time_per_step_ms, 6) if time_per_step_ms is not None else None
+        ),
+        "peak_memory_MB": (
+            round(peak_memory_MB, 2) if peak_memory_MB is not None else None
+        ),
+    }
 
 
 # functions for main FDTD loop
@@ -1653,6 +1823,44 @@ def _find_modalities_in_dir(dir_path):
     return names["flair"], names["t1"], names["t1ce"], names["t2"]
 
 
+def _load_segmentation_for_benchmark(args):
+    """Load segmentation (from --seg, --modalities, or --modalities-dir) for full-pipeline benchmark. Returns labels_3d (int32, 3D)."""
+    use_modalities = (args.modalities is not None) or (args.modalities_dir is not None)
+    if use_modalities:
+        if args.modalities_dir is not None:
+            flair_path, t1_path, t1ce_path, t2_path = _find_modalities_in_dir(
+                args.modalities_dir
+            )
+        else:
+            flair_path, t1_path, t1ce_path, t2_path = tuple(args.modalities)
+        from brain_tumor_segmentation_model import run_segmentation_from_modalities
+
+        labels_3d = run_segmentation_from_modalities(
+            flair_path,
+            t1_path,
+            t1ce_path,
+            t2_path,
+            args.checkpoint,
+            extend_with_normal_brain=not args.no_normal_brain,
+        )
+    else:
+        seg_path = args.seg or os.environ.get(
+            "BRAIN_SEGMENTATION_NII", "brain_segmentation.nii"
+        )
+        if not os.path.isfile(seg_path):
+            raise FileNotFoundError(
+                f"Segmentation file not found: {seg_path}. "
+                "Use --seg path.nii, --modalities F T1 T1CE T2, or --modalities-dir DIR"
+            )
+        img = nib.load(seg_path)
+        labels_3d = np.asarray(img.get_fdata(), dtype=np.float32).squeeze()
+        if labels_3d.ndim != 3:
+            raise ValueError(f"Expected 3D segmentation, got shape {labels_3d.shape}")
+        labels_3d = np.round(labels_3d).astype(np.int32)
+        labels_3d = np.clip(labels_3d, 0, 4)
+    return labels_3d
+
+
 parser = argparse.ArgumentParser(
     description="3D FDTD brain segmentation simulation. Provide either a segmentation NIfTI, 4 BraTS modality paths, or a modalities directory."
 )
@@ -1806,6 +2014,43 @@ parser.add_argument(
     help="Maximum grid dimension; segmentation is downsampled if larger (default: 120).",
 )
 parser.add_argument(
+    "--dx-mm",
+    type=float,
+    default=10.0,
+    help="Grid resolution (voxel size) in mm (default: 10). Converted to meters internally. "
+    "Paper recommends 1–5 mm for anatomical detail; 10 mm is used for backward compatibility.",
+)
+parser.add_argument(
+    "--courant-factor",
+    type=float,
+    default=0.99,
+    help="Safety factor for time step: dt = factor * dt_courant, where dt_courant is from the Courant stability condition (default: 0.99).",
+)
+parser.add_argument(
+    "--benchmark-grid-sizes",
+    nargs="*",
+    type=int,
+    default=None,
+    metavar="N",
+    help="Benchmark mode: run minimal FDTD for each N³ grid; write scalability JSON. "
+    "Example: --benchmark-grid-sizes 100 200 300. Default grid sizes: 100 200 300.",
+)
+parser.add_argument(
+    "--benchmark-time-steps",
+    type=int,
+    default=BENCHMARK_TIME_STEPS_DEFAULT,
+    help=f"FDTD time steps per benchmark run (default: {BENCHMARK_TIME_STEPS_DEFAULT}).",
+)
+parser.add_argument(
+    "--benchmark-grid-sizes-range",
+    nargs=3,
+    type=int,
+    default=None,
+    metavar=("A", "B", "S"),
+    help="Benchmark grid sizes as range: min A, max B, step S (e.g. 50 200 50 → 50,100,150,200). "
+    "Alternative to --benchmark-grid-sizes.",
+)
+parser.add_argument(
     "--stream-frames",
     action="store_true",
     default=True,
@@ -1944,18 +2189,30 @@ args = parser.parse_args()
 
 if __name__ == "__main__":
     # Create single timestamped results directory (only in main process; workers do not run this)
+    # When BENCHMARK_RESULTS_DIR is set (by parent benchmark), use it so all subprocess output goes in one dir
     now = datetime.now()
     timestamp_str = now.strftime("%d%m%y-%H%M%S")  # DDMMYY-HHMMSS
-    RESULTS_DIR = os.path.join("results", f"{timestamp_str}")
+    if os.environ.get("BENCHMARK_RESULTS_DIR"):
+        RESULTS_DIR = os.path.abspath(os.environ["BENCHMARK_RESULTS_DIR"])
+    else:
+        RESULTS_DIR = os.path.join("results", f"{timestamp_str}")
     os.makedirs(RESULTS_DIR, exist_ok=True)
     PROGRESS_DIR = os.path.join("results", "uploads")
     PROGRESS_FILE = os.path.join(PROGRESS_DIR, "last_run_progress.json")
-    DATA_DIR = os.path.join(RESULTS_DIR, "data")
+    # When BENCHMARK_GRID_SIZE is set (benchmark subprocess), put output in data/N, images/N, animations/N
+    benchmark_grid_subdir = os.environ.get("BENCHMARK_GRID_SIZE")
+    if benchmark_grid_subdir is not None:
+        subdir = str(benchmark_grid_subdir)
+        DATA_DIR = os.path.join(RESULTS_DIR, "data", subdir)
+        IMAGES_DIR = os.path.join(RESULTS_DIR, "images", subdir)
+        ANIMATIONS_DIR = os.path.join(RESULTS_DIR, "animations", subdir)
+    else:
+        DATA_DIR = os.path.join(RESULTS_DIR, "data")
+        IMAGES_DIR = os.path.join(RESULTS_DIR, "images")
+        ANIMATIONS_DIR = os.path.join(RESULTS_DIR, "animations")
     E_FRAMES_DIR = os.path.join(DATA_DIR, "E_frames")
     SAR_FRAMES_DIR = os.path.join(DATA_DIR, "SAR_frames")
     TEMPERATURE_FRAMES_DIR = os.path.join(DATA_DIR, "Temperature_frames")
-    IMAGES_DIR = os.path.join(RESULTS_DIR, "images")
-    ANIMATIONS_DIR = os.path.join(RESULTS_DIR, "animations")
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(E_FRAMES_DIR, exist_ok=True)
     os.makedirs(SAR_FRAMES_DIR, exist_ok=True)
@@ -1968,6 +2225,179 @@ if __name__ == "__main__":
     print(f"  E-frames: {E_FRAMES_DIR}/")
     print(f"  Images: {IMAGES_DIR}/")
     print(f"  Animations: {ANIMATIONS_DIR}/")
+
+    # ----- Benchmark mode (Objective 5: scalability) -----
+    in_benchmark_mode = (
+        args.benchmark_grid_sizes is not None
+        or getattr(args, "benchmark_grid_sizes_range", None) is not None
+    )
+    if in_benchmark_mode:
+        # Benchmark runs skip animations (subprocess gets --skip-animations; no animations in minimal FDTD path)
+        setattr(args, "skip_animations", True)
+        # Build sizes from --benchmark-grid-sizes-range A B S or --benchmark-grid-sizes list
+        if getattr(args, "benchmark_grid_sizes_range", None) is not None:
+            a, b, s = args.benchmark_grid_sizes_range
+            sizes = list(range(a, b + 1, s))
+            if not sizes:
+                sizes = BENCHMARK_GRID_SIZES_DEFAULT
+        elif (
+            args.benchmark_grid_sizes is not None and len(args.benchmark_grid_sizes) > 0
+        ):
+            sizes = args.benchmark_grid_sizes
+        else:
+            sizes = BENCHMARK_GRID_SIZES_DEFAULT
+        steps = getattr(args, "benchmark_time_steps", BENCHMARK_TIME_STEPS_DEFAULT)
+        has_anatomy = (
+            (args.seg and os.path.isfile(args.seg))
+            or (args.modalities is not None)
+            or (args.modalities_dir is not None)
+        )
+        if has_anatomy:
+            print(
+                f"\nBenchmark mode (full pipeline with anatomy): grid sizes {sizes}, "
+                f"{steps} time steps each."
+            )
+        else:
+            print(
+                f"\nBenchmark mode (FDTD-only, no anatomy): grid sizes {sizes}, "
+                f"{steps} time steps each."
+            )
+        results = []
+
+        if has_anatomy:
+            # Full-pipeline benchmark: load segmentation once, resample to each N, run engine in subprocess
+            labels_3d = _load_segmentation_for_benchmark(args)
+            sx, sy, sz = labels_3d.shape
+            engine_dir = os.path.dirname(os.path.abspath(__file__))
+            engine_script = os.path.join(engine_dir, "fdtd_brain_simulation_engine.py")
+            for N in sizes:
+                print(f"  Running full pipeline N={N} ({N**3} voxels)...")
+                zoom_factors = (N / sx, N / sy, N / sz)
+                labels_n = ndimage.zoom(
+                    labels_3d.astype(np.float32),
+                    zoom_factors,
+                    order=0,
+                    mode="nearest",
+                )
+                labels_n = np.round(labels_n).astype(np.int32)
+                labels_n = np.clip(labels_n, 0, 4)
+                base_name = f"benchmark_anatomy_{N}"
+                fd, temp_nii = tempfile.mkstemp(
+                    suffix=".nii.gz", prefix=base_name + "_", dir=engine_dir
+                )
+                os.close(fd)
+                try:
+                    affine = np.diag([1.0, 1.0, 1.0, 1.0])
+                    nib.save(
+                        nib.Nifti1Image(labels_n.astype(np.int32), affine),
+                        temp_nii,
+                    )
+                    cmd = [
+                        sys.executable,
+                        engine_script,
+                        temp_nii,  # seg is positional
+                        "--max-dim",
+                        str(N),
+                        "--time-steps",
+                        str(steps),
+                        "--skip-animations",
+                    ]
+                    t_before = time.time()
+                    subprocess_env = os.environ.copy()
+                    subprocess_env["BENCHMARK_RESULTS_DIR"] = os.path.abspath(
+                        RESULTS_DIR
+                    )
+                    subprocess_env["BENCHMARK_GRID_SIZE"] = str(N)
+                    subprocess.run(cmd, cwd=engine_dir, check=True, env=subprocess_env)
+                finally:
+                    try:
+                        os.remove(temp_nii)
+                    except OSError:
+                        pass
+                # Subprocess wrote to data/N/; find its performance JSON (mtime after start)
+                perf_files = glob.glob(
+                    os.path.join(DATA_DIR, str(N), "*_performance.json")
+                )
+                perf_files = [
+                    p for p in perf_files if os.path.getmtime(p) >= t_before - 5
+                ]
+                perf_files.sort(key=os.path.getmtime, reverse=True)
+                if perf_files:
+                    with open(perf_files[0], "r") as f:
+                        pm = json.load(f)
+                    phases = pm.get("phases_s") or {}
+                    run_metrics = {
+                        "grid_shape": pm["grid_shape"],
+                        "number_of_voxels": pm["number_of_voxels"],
+                        "time_steps": pm["time_steps"],
+                        "total_wall_time_s": round(
+                            pm.get("total_simulation_time_s")
+                            or pm.get("total_wall_time_s")
+                            or 0,
+                            6,
+                        ),
+                        "time_per_step_ms": pm.get("time_per_step_ms"),
+                        "peak_memory_MB": pm.get("peak_memory_MB"),
+                        "time_fdtd_s": phases.get("fdtd_simulation"),
+                        "time_sar_s": phases.get("sar_computation"),
+                        "time_thermal_s": phases.get("thermal_solver"),
+                    }
+                    results.append(run_metrics)
+                    print(
+                        f"    wall_time_s={run_metrics['total_wall_time_s']:.3f}, "
+                        f"time_per_step_ms={run_metrics.get('time_per_step_ms')}, "
+                        f"peak_memory_MB={run_metrics.get('peak_memory_MB')}"
+                    )
+                else:
+                    print(f"    [WARN] No performance JSON found for N={N}")
+        else:
+            for N in sizes:
+                print(f"  Running N={N} ({N**3} voxels)...")
+                run_metrics = _run_minimal_fdtd_benchmark(
+                    N,
+                    N,
+                    N,
+                    steps,
+                    dx_mm=getattr(args, "dx_mm", 10.0),
+                    courant_factor=getattr(args, "courant_factor", 0.99),
+                )
+                results.append(run_metrics)
+                print(
+                    f"    wall_time_s={run_metrics['total_wall_time_s']:.3f}, "
+                    f"time_per_step_ms={run_metrics['time_per_step_ms']:.4f}, "
+                    f"peak_memory_MB={run_metrics['peak_memory_MB']}"
+                )
+
+        scalability_path = os.path.join(DATA_DIR, "scalability_benchmark_results.json")
+        out = {
+            "benchmark_time_steps": steps,
+            "benchmark_full_pipeline": has_anatomy,
+            "backend": "numpy_numba",
+            "runs": results,
+        }
+        with open(scalability_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nScalability results written to {scalability_path}")
+
+        # Automatically run scalability plotting script
+        plot_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "plot_scalability_benchmark.py",
+        )
+        if os.path.isfile(plot_script):
+            print(f"Running {plot_script}...")
+            rc = subprocess.run(
+                [sys.executable, plot_script, scalability_path],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if rc.returncode != 0:
+                print(
+                    f"  [WARN] plot_scalability_benchmark.py exited with code {rc.returncode}"
+                )
+        else:
+            print(f"  [INFO] Plot script not found: {plot_script}")
+
+        sys.exit(0)
 
     modality_paths = args.modalities
     use_modalities = (modality_paths is not None) or (args.modalities_dir is not None)
@@ -2178,9 +2608,17 @@ if __name__ == "__main__":
     jb = simulation_size_y - npml - 1
     kb = simulation_size_z - npml - 1
 
-    # step size, time step (before allocating arrays that depend on dt/epsz)
-    dx = 0.01
-    dt = dx / 6e8
+    # step size (m), time step (before allocating arrays that depend on dt/epsz)
+    # dx from CLI --dx-mm (default 10 mm); paper recommends 1–5 mm for anatomical detail
+    dx = args.dx_mm * 1e-3  # mm -> m
+    # Uniform grid: dy = dz = dx. Courant condition (paper Sec. 3.2):
+    # dt <= 1 / (c * sqrt(1/dx^2 + 1/dy^2 + 1/dz^2)); c = speed of light in vacuum
+    c_light = 2.99792458e8  # m/s
+    dy, dz = dx, dx
+    dt_courant = 1.0 / (
+        c_light * sqrt(1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz))
+    )
+    dt = args.courant_factor * dt_courant
     epsz = 8.854e-12
 
     # Tissue properties at ~100 MHz.
@@ -2242,7 +2680,6 @@ if __name__ == "__main__":
                     lab = 0
                 eps_r, sigma_val, rho_val = TISSUE_TABLE[lab]
                 k_3d[i, j, k] = K_TISSUE.get(lab, 0.0)
-                # Avoid division by zero when sigma and eps_r are both 0 (shouldn't happen)
                 denom = eps_r + (sigma_val * dt / epsz)
                 c = 1.0 / denom if denom > 0 else 1.0
                 cond = sigma_val * dt / epsz
@@ -4091,6 +4528,9 @@ if __name__ == "__main__":
             round(peak_memory_MB, 2) if peak_memory_MB is not None else None
         ),
         "backend": "numpy_numba",
+        "dt_s": round(float(dt), 12),
+        "dt_courant_s": round(float(dt_courant), 12),
+        "courant_factor": float(args.courant_factor),
     }
     if antenna_optimization_s is not None:
         performance_metrics["phases_s"]["antenna_optimization"] = antenna_optimization_s
@@ -4199,6 +4639,8 @@ if __name__ == "__main__":
         "grid_shape": [simulation_size_x, simulation_size_y, simulation_size_z],
         "voxel_size_m": float(dx),
         "time_step_s": float(dt),
+        "dt_courant_s": float(dt_courant),
+        "courant_factor": float(args.courant_factor),
         "time_steps": time_steps,
         "frame_interval": frame_interval,
         "stream_frames": args.stream_frames,

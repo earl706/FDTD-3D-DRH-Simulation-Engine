@@ -616,7 +616,8 @@ def create_3x15_tumor_previews(
         plt.tight_layout()
         fig.savefig(
             os.path.join(
-                output_dir, f"{case_name}_tumor_preview_flair_segmentation.png"
+                output_dir,
+                f"{case_name}_distribution_tumor_preview_flair_segmentation.png",
             ),
             dpi=100,
             bbox_inches="tight",

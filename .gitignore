@@ -13,6 +13,7 @@ dataset/
 cervical_dataset/
 BC_MRI_SEG/
 3D_FDTD_D
+fdtd_equations_reference.tex
 
 # Env and OS
 .env
