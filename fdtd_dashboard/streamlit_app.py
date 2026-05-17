@@ -49,7 +49,7 @@ def get_uploads_dir():
 
 
 def discover_runs(results_root):
-    """List run folders (timestamp dirs) that contain at least one metadata.json."""
+    """List discovered runs from results/, including benchmark subfolders."""
     if not results_root or not results_root.is_dir():
         return []
     runs = []
@@ -59,7 +59,8 @@ def discover_runs(results_root):
         data_dir = path / "data"
         if not data_dir.is_dir():
             continue
-        for f in data_dir.glob("*_metadata.json"):
+        # Standard runs: results/<run_id>/data/*_metadata.json
+        for f in sorted(data_dir.glob("*_metadata.json"), reverse=True):
             runs.append(
                 {
                     "run_id": path.name,
@@ -68,7 +69,19 @@ def discover_runs(results_root):
                     "output_base": f.stem.replace("_metadata", ""),
                 }
             )
-            break  # one metadata per run folder for now
+        # Benchmark full-pipeline runs: results/<run_id>/data/<N>/*_metadata.json
+        for sub_data_dir in sorted(data_dir.iterdir(), reverse=True):
+            if not sub_data_dir.is_dir():
+                continue
+            for f in sorted(sub_data_dir.glob("*_metadata.json"), reverse=True):
+                runs.append(
+                    {
+                        "run_id": f"{path.name}-N{sub_data_dir.name}",
+                        "data_dir": sub_data_dir,
+                        "metadata_file": f,
+                        "output_base": f.stem.replace("_metadata", ""),
+                    }
+                )
     return runs
 
 
@@ -102,6 +115,91 @@ def load_run_data(run):
     }
 
 
+def format_duration_seconds(seconds):
+    """Format a duration in seconds as sec, min, or hr for display."""
+    if seconds is None:
+        return "—"
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return "—"
+    if s < 0:
+        s = 0.0
+    if s < 60:
+        return f"{s:.1f} sec"
+    if s < 3600:
+        return f"{s / 60:.1f} min"
+    return f"{s / 3600:.1f} hr"
+
+
+def format_time_per_step_ms(ms):
+    """Format FDTD wall time per step: μs, ms, or sec (similar spirit to format_duration_seconds)."""
+    if ms is None:
+        return "—"
+    try:
+        m = float(ms)
+    except (TypeError, ValueError):
+        return "—"
+    if m < 0:
+        m = 0.0
+    if m >= 1000:
+        return f"{m / 1000:.2f} sec"
+    if m >= 1:
+        return f"{m:.2f} ms"
+    if m >= 0.001:
+        return f"{m:.3f} ms"
+    return f"{m * 1000:.2f} μs"
+
+
+def format_peak_memory_mb(mb_mb):
+    """
+    Format peak_memory_MB (numeric megabytes from the engine) as B, KB, MB, or GB (binary steps).
+    """
+    if mb_mb is None:
+        return "—"
+    try:
+        mib = float(mb_mb)
+    except (TypeError, ValueError):
+        return "—"
+    if mib < 0:
+        mib = 0.0
+    b = mib * (1024.0**2)
+    if b < 1024:
+        return f"{b:.0f} B"
+    kb = b / 1024.0
+    if kb < 1024:
+        return f"{kb:.1f} KB"
+    mb = kb / 1024.0
+    if mb < 1024:
+        return f"{mb:.1f} MB"
+    gb = mb / 1024.0
+    return f"{gb:.2f} GB"
+
+
+def load_antenna_optimization_json(data_dir, output_base):
+    """Optional {output_base}_antenna_optimization.json from --optimize-antenna runs."""
+    path = Path(data_dir) / f"{output_base}_antenna_optimization.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def load_objective_json(data_dir, output_base):
+    """{output_base}_objective.json — J from final time-domain SAR (all runs)."""
+    path = Path(data_dir) / f"{output_base}_objective.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Visualizations
 # -----------------------------------------------------------------------------
@@ -111,22 +209,79 @@ def render_kpis(perf, run_id):
     total_s = perf.get("total_simulation_time_s") or perf.get("total_wall_time_s") or 0
     phases = perf.get("phases_s") or {}
     anim_s = phases.get("animations")
+    total_display = format_duration_seconds(total_s) if total_s else "—"
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("Total simulation time (s)", f"{total_s:.2f}")
+        st.metric("Total simulation time", total_display)
     with col2:
-        st.metric("Time/step (ms)", f"{perf.get('time_per_step_ms') or 0:.2f}")
+        st.metric(
+            "Time per FDTD step",
+            format_time_per_step_ms(perf.get("time_per_step_ms")),
+        )
     with col3:
         nv = perf.get("number_of_voxels") or 0
         st.metric("Voxels", f"{nv:,}")
     with col4:
         mem = perf.get("peak_memory_MB")
-        st.metric("Peak memory (MB)", f"{mem:.1f}" if mem is not None else "—")
+        st.metric("Peak memory", format_peak_memory_mb(mem))
     with col5:
-        st.metric("Animation time (s)", f"{anim_s:.2f}" if anim_s is not None else "—")
+        st.metric(
+            "Animation time",
+            format_duration_seconds(anim_s) if anim_s is not None else "—",
+        )
 
 
-def render_time_breakdown(perf):
+def _add_duration_column(df, seconds_col="Time (s)"):
+    """Add human-readable Duration column; values in seconds_col unchanged for charts."""
+    out = df.copy()
+    out["Duration"] = out[seconds_col].apply(
+        lambda x: format_duration_seconds(x) if x is not None else "—"
+    )
+    return out
+
+
+def _pie_hover_duration(labels, values_sec):
+    """Pie trace with hover showing phase + formatted duration + percent."""
+    dur = [format_duration_seconds(v) for v in values_sec]
+    return go.Pie(
+        labels=labels,
+        values=values_sec,
+        hole=0.4,
+        textinfo="label+percent",
+        hovertemplate="<b>%{label}</b><br>%{customdata}<br>%{percent}<extra></extra>",
+        customdata=dur,
+    )
+
+
+def _bar_chart_with_duration_hover(df, x_col, y_col="Time (s)", title=None):
+    """Bar chart: y stays in seconds; hover shows formatted duration."""
+    fig = px.bar(df, x=x_col, y=y_col, color=y_col)
+    dur = [format_duration_seconds(v) for v in df[y_col]]
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{x}</b><br>%{customdata}<br>"
+            "<span style='font-size:0.85em'>(%{y:.3f} s)</span><extra></extra>"
+        ),
+        customdata=dur,
+    )
+    layout = dict(
+        xaxis_tickangle=-30,
+        height=320 if title == "Pipeline phases" else 300,
+        yaxis_title="Time (seconds)",
+    )
+    if title == "Pipeline phases":
+        layout["margin"] = dict(b=120)
+    if title:
+        layout["title"] = title
+    fig.update_layout(**layout)
+    return fig
+
+
+def render_time_breakdown(perf, *, chart_key_prefix: str = "time_breakdown"):
+    """
+    Pipeline phase charts. Pass a unique ``chart_key_prefix`` when this function is
+    used in more than one tab (e.g. Overview + Scalability) to avoid duplicate element IDs.
+    """
     phases = perf.get("phases_s")
     if phases:
         # Phases: segmentation, setup, [antenna_optimization], fdtd_simulation, sar_computation, thermal_solver, saving_data, animations
@@ -143,29 +298,35 @@ def render_time_breakdown(perf):
         if total <= 0:
             st.warning("No time breakdown data.")
             return
+        df_display = _add_duration_column(df)
         col1, col2 = st.columns(2)
         with col1:
             fig_pie = go.Figure(
                 data=[
-                    go.Pie(
-                        labels=df["Phase"],
-                        values=df["Time (s)"],
-                        hole=0.4,
-                        textinfo="label+percent",
-                    )
+                    _pie_hover_duration(df["Phase"].tolist(), df["Time (s)"].tolist())
                 ]
             )
             fig_pie.update_layout(title="Pipeline phases", height=320)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(
+                fig_pie, width="stretch", key=f"{chart_key_prefix}_phases_pie"
+            )
         with col2:
-            fig_bar = px.bar(df, x="Phase", y="Time (s)", color="Time (s)")
-            fig_bar.update_layout(xaxis_tickangle=-30, height=320, margin=dict(b=120))
-            st.plotly_chart(fig_bar, use_container_width=True)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            fig_bar = _bar_chart_with_duration_hover(
+                df, "Phase", "Time (s)", title="Pipeline phases"
+            )
+            st.plotly_chart(
+                fig_bar, width="stretch", key=f"{chart_key_prefix}_phases_bar"
+            )
+        st.dataframe(
+            df_display[["Phase", "Duration"]],
+            width="stretch",
+            hide_index=True,
+        )
         total_sim = perf.get("total_simulation_time_s")
         if total_sim is not None:
             st.caption(
-                f"Total simulation time (segmentation → animations): {total_sim:.2f} s"
+                f"Total simulation time (segmentation → animations): "
+                f"{format_duration_seconds(total_sim)} ({float(total_sim):.2f} s)"
             )
         return
     # Fallback: legacy format (FDTD, SAR, Thermal only)
@@ -182,24 +343,28 @@ def render_time_breakdown(perf):
             "Time (s)": [time_fdtd, time_sar, time_thermal],
         }
     )
+    df_display = df.copy()
+    df_display["Duration"] = df_display["Time (s)"].apply(
+        lambda x: format_duration_seconds(x) if x is not None else "—"
+    )
+
     col1, col2 = st.columns(2)
     with col1:
         fig_pie = go.Figure(
-            data=[
-                go.Pie(
-                    labels=df["Stage"],
-                    values=df["Time (s)"],
-                    hole=0.4,
-                    textinfo="label+percent",
-                )
-            ]
+            data=[_pie_hover_duration(df["Stage"].tolist(), df["Time (s)"].tolist())]
         )
         fig_pie.update_layout(title="Time breakdown", height=300)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width="stretch", key=f"{chart_key_prefix}_legacy_pie")
     with col2:
-        fig_bar = px.bar(df, x="Stage", y="Time (s)", color="Time (s)")
-        fig_bar.update_layout(height=300)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        fig_bar = _bar_chart_with_duration_hover(
+            df, "Stage", "Time (s)", title="Time breakdown"
+        )
+        st.plotly_chart(fig_bar, width="stretch", key=f"{chart_key_prefix}_legacy_bar")
+    st.dataframe(
+        df_display[["Stage", "Duration"]],
+        width="stretch",
+        hide_index=True,
+    )
 
 
 def _region_stats_rows(rs, key_prefix):
@@ -216,7 +381,7 @@ def _region_stats_rows(rs, key_prefix):
     return rows
 
 
-def render_region_stats(meta):
+def render_region_stats(meta, *, chart_key_prefix: str = "region"):
     rs = meta.get("region_stats") or {}
     if not rs:
         st.info("No region stats in this run.")
@@ -229,8 +394,8 @@ def render_region_stats(meta):
         df_sar = pd.DataFrame(sar_rows)
         fig_sar = px.bar(df_sar, x="Metric", y="Value", title="SAR by region")
         fig_sar.update_layout(xaxis_tickangle=-45, height=360)
-        st.plotly_chart(fig_sar, use_container_width=True)
-        st.dataframe(df_sar, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig_sar, width="stretch", key=f"{chart_key_prefix}_sar_bar")
+        st.dataframe(df_sar, width="stretch", hide_index=True)
 
     # Temperature section
     temp_rows = _region_stats_rows(rs, "temperature_")
@@ -239,8 +404,8 @@ def render_region_stats(meta):
         df_temp = pd.DataFrame(temp_rows)
         fig_temp = px.bar(df_temp, x="Metric", y="Value", title="Temperature by region")
         fig_temp.update_layout(xaxis_tickangle=-45, height=360)
-        st.plotly_chart(fig_temp, use_container_width=True)
-        st.dataframe(df_temp, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig_temp, width="stretch", key=f"{chart_key_prefix}_temp_bar")
+        st.dataframe(df_temp, width="stretch", hide_index=True)
 
     if not sar_rows and not temp_rows:
         st.caption("No SAR or temperature region stats in this run.")
@@ -263,35 +428,200 @@ def render_tissue_properties(meta):
             "k_W_per_mK": "k (W/(m·K))",
         }
     )
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
 
-def render_antenna_params(meta):
-    if not meta.get("antenna_optimized"):
-        st.info("Antenna was not optimized for this run.")
-        return
-    st.subheader("Antenna optimization")
-    st.write(f"**Optimized frequency:** {meta.get('optimized_f0_Hz', 0) / 1e6:.1f} MHz")
-    alphas = meta.get("optimized_alphas") or []
-    thetas = meta.get("optimized_thetas_rad") or []
-    if alphas:
-        fig_a = go.Figure(
-            data=[go.Bar(x=[f"Q{i+1}" for i in range(len(alphas))], y=alphas)]
+def render_objective_function_block(meta, data_dir, output_base):
+    """Final SAR objective (all runs); optional frequency-domain optimization comparison."""
+    obj = meta.get("objective") or load_objective_json(data_dir, output_base)
+    st.subheader("Objective function (final SAR field)")
+    if obj and obj.get("valid"):
+        J = obj.get("J")
+        J_eff = obj.get("J_eff")
+        mt = obj.get("mean_sar_tumor_W_per_kg")
+        mh = obj.get("mean_sar_healthy_W_per_kg")
+        p95 = obj.get("p95_sar_healthy_W_per_kg")
+        pw = obj.get("penalty_weight", 0)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric(
+                "J (mean tumor SAR / mean healthy SAR)",
+                f"{J:.6f}" if J is not None else "—",
+            )
+        with c2:
+            if pw and pw > 0:
+                st.metric(
+                    "J_eff (robust objective)",
+                    f"{J_eff:.6f}" if J_eff is not None else "—",
+                )
+            else:
+                st.metric("J_eff (robust objective)", "— (penalty_weight=0)")
+        with c3:
+            st.metric("Mean SAR tumor (W/kg)", f"{mt:.6g}" if mt is not None else "—")
+        with c4:
+            st.metric("Mean SAR healthy (W/kg)", f"{mh:.6g}" if mh is not None else "—")
+        if p95 is not None:
+            st.caption(
+                f"P95 SAR in healthy labels: {p95:.6g} W/kg · penalty_weight: {pw}"
+            )
+        st.caption(obj.get("definition", ""))
+        with st.expander("Full objective record (metadata / objective.json)"):
+            st.json(obj)
+    elif obj and not obj.get("valid", True):
+        st.warning(
+            f"Objective **J** is undefined for this run: **{obj.get('reason', 'unknown')}**. "
+            "Check tumor and healthy-label segmentation."
         )
-        fig_a.update_layout(title="Amplitude (α) per quadrant", height=280)
-        st.plotly_chart(fig_a, use_container_width=True)
-    if thetas:
-        fig_t = go.Figure(
-            data=[go.Bar(x=[f"Q{i+1}" for i in range(len(thetas))], y=thetas)]
+        with st.expander("Objective record"):
+            st.json(obj)
+    else:
+        st.info(
+            f"No objective block in metadata and no **{output_base}_objective.json** (older run). "
+            "Re-run the simulation with a current engine to generate J."
         )
-        fig_t.update_layout(title="Phase θ (rad) per quadrant", height=280)
-        st.plotly_chart(fig_t, use_container_width=True)
+
+    opt = load_antenna_optimization_json(data_dir, output_base)
+    if opt:
+        st.subheader("Antenna optimization (frequency-domain, pre–full FDTD)")
+        baseline = opt.get("baseline") or {}
+        optimized = opt.get("optimized") or {}
+        jb = baseline.get("J")
+        jo = optimized.get("J")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                "J baseline (complex-field synthesis)",
+                f"{jb:.6f}" if jb is not None else "—",
+            )
+        with c2:
+            st.metric(
+                "J optimized (complex-field synthesis)",
+                f"{jo:.6f}" if jo is not None else "—",
+            )
+        with c3:
+            if jb is not None and jo is not None and jb != 0:
+                st.metric(
+                    "Relative change vs baseline",
+                    f"{100.0 * (jo - jb) / abs(jb):.1f}%",
+                )
+            else:
+                st.metric("Relative change vs baseline", "—")
+        st.caption(
+            "Values from the frequency-domain quadrant optimization step (`--optimize-antenna`). "
+            "Compare with **J** above from the final time-domain SAR volume."
+        )
+        with st.expander("Full antenna_optimization.json"):
+            st.json(opt)
+
+
+def render_region_tissue_and_objective(
+    meta, data_dir, output_base, *, chart_key_prefix: str = "region"
+):
+    """Combined: SAR/T region stats, tissue table, optimization objective."""
+    render_region_stats(meta, chart_key_prefix=chart_key_prefix)
+    st.divider()
+    render_tissue_properties(meta)
+    st.divider()
+    render_objective_function_block(meta, data_dir, output_base)
+
+
+def render_antenna_params(meta, *, chart_key_prefix: str = "antenna"):
+    """Unified `antenna_parameters` for every run; plus legacy charts for quadrant modes."""
+    ap = meta.get("antenna_parameters")
+    if ap:
+        st.subheader("Excitation & antenna parameters")
+        rows = []
+        for k, v in ap.items():
+            if isinstance(v, (list, dict)):
+                val_display = json.dumps(v)
+            else:
+                val_display = "" if v is None else str(v)
+            rows.append({"Parameter": k, "Value": val_display})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.info(
+            "No `antenna_parameters` block in metadata (older run). "
+            "Legacy fields below if present."
+        )
+
+    if meta.get("antenna_optimized"):
+        st.subheader("Optimized quadrant weights")
+        st.write(
+            f"**Optimized frequency:** {meta.get('optimized_f0_Hz', 0) / 1e6:.1f} MHz"
+        )
+        alphas = meta.get("optimized_alphas") or []
+        thetas = meta.get("optimized_thetas_rad") or []
+        if alphas:
+            fig_a = go.Figure(
+                data=[go.Bar(x=[f"Q{i+1}" for i in range(len(alphas))], y=alphas)]
+            )
+            fig_a.update_layout(title="Amplitude (α) per quadrant", height=280)
+            st.plotly_chart(
+                fig_a, width="stretch", key=f"{chart_key_prefix}_opt_alphas"
+            )
+        if thetas:
+            fig_t = go.Figure(
+                data=[go.Bar(x=[f"Q{i+1}" for i in range(len(thetas))], y=thetas)]
+            )
+            fig_t.update_layout(title="Phase θ (rad) per quadrant", height=280)
+            st.plotly_chart(
+                fig_t, width="stretch", key=f"{chart_key_prefix}_opt_thetas"
+            )
+    elif meta.get("quadrant_fixed"):
+        st.subheader("Fixed quadrant configuration")
+        st.write(f"**Carrier frequency:** {meta.get('fixed_f0_Hz', 0) / 1e6:.1f} MHz")
+        alphas = meta.get("fixed_alphas") or []
+        thetas = meta.get("fixed_thetas_rad") or []
+        if alphas:
+            fig_a = go.Figure(
+                data=[go.Bar(x=[f"Q{i+1}" for i in range(len(alphas))], y=alphas)]
+            )
+            fig_a.update_layout(title="Amplitude (α) per quadrant", height=280)
+            st.plotly_chart(
+                fig_a, width="stretch", key=f"{chart_key_prefix}_fixed_alphas"
+            )
+        if thetas:
+            fig_t = go.Figure(
+                data=[go.Bar(x=[f"Q{i+1}" for i in range(len(thetas))], y=thetas)]
+            )
+            fig_t.update_layout(title="Phase θ (rad) per quadrant", height=280)
+            st.plotly_chart(
+                fig_t, width="stretch", key=f"{chart_key_prefix}_fixed_thetas"
+            )
+    elif not ap:
+        st.subheader("Legacy pulse-source metadata")
+        if meta.get("pulse_type"):
+            st.write(f"**Pulse type:** {meta.get('pulse_type')}")
+        if meta.get("prop_direction") is not None:
+            st.write(f"**Propagation:** {meta.get('prop_direction')}")
+        if meta.get("pulse_freq_Hz") is not None:
+            st.write(f"**Pulse frequency:** {meta['pulse_freq_Hz'] / 1e6:.6f} MHz")
+        if meta.get("source_x") is not None:
+            st.write(
+                f"**Primary source voxel:** ({meta.get('source_x')}, {meta.get('source_y')}, {meta.get('source_z')})"
+            )
 
 
 def render_scalability(runs_data):
-    """Compare multiple runs: time and memory vs voxels."""
-    if len(runs_data) < 2:
-        st.info("Select multiple runs or 'Compare all' to see scalability.")
+    """
+    Multi-run: wall time and peak memory vs voxel count (scalability curves).
+    Single-run: same performance summary as Overview (KPIs + phase breakdown) so
+    this tab is useful before multiple runs exist.
+    """
+    if not runs_data:
+        return
+    if len(runs_data) == 1:
+        d = runs_data[0]
+        st.info(
+            "Only one run is loaded. Below is a **performance summary** (phases, time per FDTD step, "
+            "memory). Enable **Compare all runs (scalability)** in the sidebar or add more runs under "
+            "`results/` to plot wall time and memory vs voxels across runs."
+        )
+        render_kpis(d["performance"], d["run_id"])
+        st.subheader("Pipeline phases")
+        render_time_breakdown(
+            d["performance"], chart_key_prefix=f"scalability_{d['run_id']}"
+        )
         return
     rows = []
     for d in runs_data:
@@ -315,7 +645,7 @@ def render_scalability(runs_data):
         fig_time.update_layout(
             title="Wall time vs voxels", xaxis_title="Voxels", yaxis_title="Time (s)"
         )
-        st.plotly_chart(fig_time, use_container_width=True)
+        st.plotly_chart(fig_time, width="stretch", key="scalability_multi_time")
     with col2:
         fig_mem = px.scatter(df, x="voxels", y="peak_memory_MB", hover_data=["run_id"])
         fig_mem.update_layout(
@@ -323,8 +653,8 @@ def render_scalability(runs_data):
             xaxis_title="Voxels",
             yaxis_title="Memory (MB)",
         )
-        st.plotly_chart(fig_mem, use_container_width=True)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig_mem, width="stretch", key="scalability_multi_mem")
+    st.dataframe(df, width="stretch", hide_index=True)
 
 
 def _load_nifti(path):
@@ -353,21 +683,140 @@ _SEGMENTATION_COLORSCALE = [
 ]
 
 
-def render_slice_viewer(data_dir, output_base, run_id=None):
+def _heatmap_layout(title, height=400):
+    return dict(
+        title=title,
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(scaleanchor="y", constrain="domain"),
+        yaxis=dict(constrain="domain"),
+    )
+
+
+def render_unified_slice_timestep_viewer(data_dir, output_base, meta, run_id):
     """
-    Slider-controlled slice viewer for SAR, Temperature, and Segmentation NIfTIs.
-    Uses axial slices (index k in third dimension). Only shown when a single run is selected.
+    Per-frame NPZ: two sliders — frame index (timestep) and axial slice z — for SAR & temperature;
+    segmentation uses the same z (static labels). Without frames: one z slider for static NIfTI.
     """
     try:
-        import nibabel as nib
+        import nibabel as nib  # noqa: F401 — used by _load_nifti
     except ImportError:
         st.warning("Install `nibabel` to use the slice viewer.")
         return
 
+    data_dir = Path(data_dir)
     sar_path = data_dir / f"{output_base}_SAR.nii.gz"
     temp_path = data_dir / f"{output_base}_temperature.nii.gz"
     seg_path = data_dir / f"{output_base}_segmentation.nii.gz"
 
+    seg_vol, seg_sh = _load_nifti(seg_path)
+    grid = meta.get("grid_shape") or []
+    if len(grid) == 3 and all(x > 0 for x in grid):
+        nx, ny, nz = int(grid[0]), int(grid[1]), int(grid[2])
+    elif seg_sh is not None:
+        nx, ny, nz = seg_sh[0], seg_sh[1], seg_sh[2]
+    else:
+        nz = 0
+        nx = ny = 0
+
+    n_frames = meta.get("n_frames") or 0
+    chunk_size = meta.get("E_frames_chunk_size", 20)
+    sar_parts = meta.get("SAR_frames_n_parts") or 0
+    temp_parts = meta.get("Temperature_frames_n_parts") or 0
+    has_frames = n_frames > 0 and (sar_parts > 0 or temp_parts > 0)
+
+    key_base = run_id or output_base
+    key_frame = f"unified_frame_{key_base}"
+    key_z = f"unified_z_{key_base}"
+    key_static_z = f"unified_static_z_{key_base}"
+
+    if has_frames and nz > 0:
+        default_f = min(max(n_frames // 2, 0), n_frames - 1)
+        default_k = nz // 2
+        frame_idx = st.slider(
+            "Frame index (timestep)",
+            0,
+            n_frames - 1,
+            default_f,
+            key=key_frame,
+            help="Saved simulation frame index (SAR and temperature volumes).",
+        )
+        k = st.slider(
+            "Axial slice (z)",
+            0,
+            nz - 1,
+            default_k,
+            key=key_z,
+            help="Slice index along z for SAR, temperature, and segmentation.",
+        )
+        part = frame_idx // chunk_size
+        local_idx = frame_idx % chunk_size
+        data_dir_str = str(data_dir)
+        cols = st.columns(3)
+
+        with cols[0]:
+            if sar_parts > 0 and part < sar_parts:
+                chunk_sar = load_frames_chunk(
+                    data_dir_str, output_base, "SAR_frames", part
+                )
+                if chunk_sar is not None and local_idx < len(chunk_sar):
+                    vol = chunk_sar[local_idx]
+                    kk = min(k, vol.shape[2] - 1)
+                    slice_2d = vol[:, :, kk]
+                    fig = go.Figure(data=go.Heatmap(z=slice_2d.T, colorscale="Viridis"))
+                    fig.update_layout(
+                        **_heatmap_layout(f"SAR (frame {frame_idx}, z={kk})")
+                    )
+                    st.plotly_chart(
+                        fig, width="stretch", key=f"{key_base}_frame_sar_heatmap"
+                    )
+                else:
+                    st.caption("SAR frame not available.")
+            else:
+                st.caption("No SAR frames.")
+
+        with cols[1]:
+            if temp_parts > 0 and part < temp_parts:
+                chunk_temp = load_frames_chunk(
+                    data_dir_str, output_base, "Temperature_frames", part
+                )
+                if chunk_temp is not None and local_idx < len(chunk_temp):
+                    vol = chunk_temp[local_idx]
+                    kk = min(k, vol.shape[2] - 1)
+                    slice_2d = vol[:, :, kk]
+                    fig = go.Figure(data=go.Heatmap(z=slice_2d.T, colorscale="Viridis"))
+                    fig.update_layout(
+                        **_heatmap_layout(f"Temperature (frame {frame_idx}, z={kk})")
+                    )
+                    st.plotly_chart(
+                        fig, width="stretch", key=f"{key_base}_frame_temp_heatmap"
+                    )
+                else:
+                    st.caption("Temperature frame not available.")
+            else:
+                st.caption("No temperature frames.")
+
+        with cols[2]:
+            if seg_vol is not None:
+                kk = min(k, seg_vol.shape[2] - 1)
+                slice_2d = seg_vol[:, :, kk]
+                z_plot = np.clip(slice_2d, 0, 4).astype(np.float64) / 4.0
+                fig = go.Figure(
+                    data=go.Heatmap(
+                        z=z_plot.T,
+                        colorscale=_SEGMENTATION_COLORSCALE,
+                        showscale=True,
+                    )
+                )
+                fig.update_layout(**_heatmap_layout(f"Segmentation (z={kk})"))
+                st.plotly_chart(
+                    fig, width="stretch", key=f"{key_base}_frame_seg_heatmap"
+                )
+            else:
+                st.caption("No segmentation NIfTI.")
+        return
+
+    # No per-frame NPZ: static NIfTI volumes, single axial slider
     volumes = {}
     shape = None
     for name, path, key in [
@@ -382,27 +831,25 @@ def render_slice_viewer(data_dir, output_base, run_id=None):
                 shape = sh
 
     if not volumes:
-        st.caption("No NIfTI data found (SAR, temperature, or segmentation).")
+        st.caption(
+            "No NIfTI data and no per-frame SAR/temperature arrays for this run."
+        )
         return
 
     nx, ny, nz = shape
-    k_default = nz // 2
-    slice_key = f"slice_z_{run_id or output_base}"
     k = st.slider(
         "Axial slice (z)",
         0,
         nz - 1,
-        k_default,
-        key=slice_key,
-        help="Select slice index along the z (axial) axis.",
+        nz // 2,
+        key=key_static_z,
+        help="Select slice index along z (no time frames saved for this run).",
     )
-
     cols = st.columns(len(volumes))
     for idx, (key, (name, vol)) in enumerate(volumes.items()):
         with cols[idx]:
             slice_2d = vol[:, :, k]
             if key == "seg":
-                # Discrete labels 0..4: use normalized values for colorscale
                 z_plot = np.clip(slice_2d, 0, 4).astype(np.float64) / 4.0
                 fig = go.Figure(
                     data=go.Heatmap(
@@ -413,14 +860,10 @@ def render_slice_viewer(data_dir, output_base, run_id=None):
                 )
             else:
                 fig = go.Figure(data=go.Heatmap(z=slice_2d.T, colorscale="Viridis"))
-            fig.update_layout(
-                title=f"{name} (z={k})",
-                height=400,
-                margin=dict(l=10, r=10, t=40, b=10),
-                xaxis=dict(scaleanchor="y", constrain="domain"),
-                yaxis=dict(constrain="domain"),
+            fig.update_layout(**_heatmap_layout(f"{name} (z={k})"))
+            st.plotly_chart(
+                fig, width="stretch", key=f"{key_base}_static_{key}_heatmap"
             )
-            st.plotly_chart(fig, use_container_width=True)
 
 
 def load_time_series(data_dir, output_base):
@@ -501,7 +944,11 @@ def render_time_series_plots(data_dir, output_base):
             yaxis_title="SAR (W/kg)",
             height=360,
         )
-        st.plotly_chart(fig_sar, use_container_width=True)
+        st.plotly_chart(
+            fig_sar,
+            width="stretch",
+            key=f"ts_sar_{output_base}",
+        )
     with col2:
         fig_temp = go.Figure()
         fig_temp.add_trace(
@@ -526,97 +973,33 @@ def render_time_series_plots(data_dir, output_base):
             yaxis_title="Temperature (°C)",
             height=360,
         )
-        st.plotly_chart(fig_temp, use_container_width=True)
+        st.plotly_chart(
+            fig_temp,
+            width="stretch",
+            key=f"ts_temp_{output_base}",
+        )
 
 
-def render_timestep_viewer(data_dir, output_base, meta, run_id=None):
+def render_slice_and_timestep_viewer(data_dir, output_base, meta, run_id):
     """
-    Slider-controlled viewer for per-frame SAR and Temperature volumes (from NPZ chunks).
-    Shows axial mid-slice for the selected frame index.
+    SAR, temperature & segmentation: independent frame (timestep) and axial z sliders when
+    per-frame NPZ exists; else one z slider for static NIfTI. Then scalar time-series plots.
     """
-    data_dir = Path(data_dir)
-    n_frames = meta.get("n_frames") or 0
-    chunk_size = meta.get("E_frames_chunk_size", 20)
-    sar_parts = meta.get("SAR_frames_n_parts") or 0
-    temp_parts = meta.get("Temperature_frames_n_parts") or 0
-    grid = meta.get("grid_shape") or []
-    if len(grid) != 3:
-        grid = [0, 0, 0]
-    nx, ny, nz = grid
-    if n_frames <= 0 or (sar_parts <= 0 and temp_parts <= 0):
-        st.caption(
-            "No per-frame SAR/Temperature data (run may predate SAR_frames/Temperature_frames)."
-        )
-        return
-    frame_key = f"timestep_frame_{run_id or output_base}"
-    frame_idx = st.slider(
-        "Frame index",
-        0,
-        n_frames - 1,
-        min(n_frames // 2, n_frames - 1) if n_frames else 0,
-        key=frame_key,
-        help="Select which saved frame to display (each frame corresponds to a time step).",
-    )
-    part = frame_idx // chunk_size
-    local_idx = frame_idx % chunk_size
-    data_dir_str = str(data_dir)
-    cols = st.columns(2)
-    if sar_parts > 0 and part < sar_parts:
-        chunk_sar = load_frames_chunk(data_dir_str, output_base, "SAR_frames", part)
-        if chunk_sar is not None and local_idx < len(chunk_sar):
-            vol = chunk_sar[local_idx]
-            k = vol.shape[2] // 2
-            slice_2d = vol[:, :, k]
-            with cols[0]:
-                fig = go.Figure(data=go.Heatmap(z=slice_2d.T, colorscale="Viridis"))
-                fig.update_layout(
-                    title=f"SAR frame {frame_idx} (z={k})",
-                    height=400,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    xaxis=dict(scaleanchor="y", constrain="domain"),
-                    yaxis=dict(constrain="domain"),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            with cols[0]:
-                st.caption("SAR frame not available.")
-    else:
-        with cols[0]:
-            st.caption("No SAR frames.")
-    if temp_parts > 0 and part < temp_parts:
-        chunk_temp = load_frames_chunk(
-            data_dir_str, output_base, "Temperature_frames", part
-        )
-        if chunk_temp is not None and local_idx < len(chunk_temp):
-            vol = chunk_temp[local_idx]
-            k = vol.shape[2] // 2
-            slice_2d = vol[:, :, k]
-            with cols[1]:
-                fig = go.Figure(data=go.Heatmap(z=slice_2d.T, colorscale="Viridis"))
-                fig.update_layout(
-                    title=f"Temperature frame {frame_idx} (z={k})",
-                    height=400,
-                    margin=dict(l=10, r=10, t=40, b=10),
-                    xaxis=dict(scaleanchor="y", constrain="domain"),
-                    yaxis=dict(constrain="domain"),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            with cols[1]:
-                st.caption("Temperature frame not available.")
-    else:
-        with cols[1]:
-            st.caption("No temperature frames.")
+    st.subheader("SAR, temperature & segmentation (frame & axial slice)")
+    render_unified_slice_timestep_viewer(data_dir, output_base, meta, run_id)
+    st.divider()
+    st.subheader("Time step vs SAR / temperature (scalars)")
+    render_time_series_plots(data_dir, output_base)
 
 
 def render_nifti_slice(run, output_base, data_dir):
-    """Sidebar: quick link to Slice viewer tab when NIfTI data exists."""
+    """Sidebar: quick link to combined slice & timestep viewer when NIfTI data exists."""
     sar_path = data_dir / f"{output_base}_SAR.nii.gz"
     temp_path = data_dir / f"{output_base}_temperature.nii.gz"
     seg_path = data_dir / f"{output_base}_segmentation.nii.gz"
     if any(p.exists() for p in (sar_path, temp_path, seg_path)):
         st.caption(
-            "Use the **Slice viewer** tab to browse SAR, Temperature, and Segmentation slices."
+            "Use the **Slice & timestep viewer** tab for slices, time series, and frames."
         )
 
 
@@ -1261,8 +1644,12 @@ def render_run_simulation():
                     zip_buffer.seek(0)
                     run_local_html = _make_run_local_html(config_json_str)
 
-                    st.success("Run package ready. Download both items below, then follow the steps on the Run page.")
-                    st.markdown("**Steps:** 1) Start the local runner on your PC: `python fdtd_dashboard/local_runner.py` (from repo root). 2) Download and extract the run package ZIP. 3) Download and open the Run page (HTML). 4) Enter the path to the extracted folder and click Run.")
+                    st.success(
+                        "Run package ready. Download both items below, then follow the steps on the Run page."
+                    )
+                    st.markdown(
+                        "**Steps:** 1) Start the local runner on your PC: `python fdtd_dashboard/local_runner.py` (from repo root). 2) Download and extract the run package ZIP. 3) Download and open the Run page (HTML). 4) Enter the path to the extracted folder and click Run."
+                    )
                     col1, col2 = st.columns(2)
                     with col1:
                         st.download_button(
@@ -1374,7 +1761,7 @@ def render_images_and_animations(runs_data):
                         with cols[j]:
                             st.caption(path.name)
                             try:
-                                st.image(str(path), use_container_width=True)
+                                st.image(str(path), width="stretch")
                             except Exception as e:
                                 st.error(f"Could not load: {e}")
 
@@ -1408,18 +1795,16 @@ def render_images_and_animations(runs_data):
 # Main app
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="FDTD Results", page_icon="⚛️", layout="wide")
+st.set_page_config(page_title="HERMES Dashboard", page_icon="⚛️", layout="wide")
 
-st.title("FDTD Simulation Results Dashboard")
-st.caption(
-    "Renders metadata.json, performance.json, and optional NIfTI from fdtd_brain_simulation_engine.py"
-)
+st.title("HERMES")
+st.caption("Hyperthermia Electromagnetic & Robust Modeling Evaluation Suite. ")
 
 results_root = get_results_root()
 runs = discover_runs(results_root)
 
 if not runs:
-    st.sidebar.warning("No runs yet. Use the **Run simulation** tab to create one.")
+    st.sidebar.warning("No runs yet. Use the **Simulation** tab to create one.")
 
 # Sidebar: run selection
 st.sidebar.header("Run selection")
@@ -1464,26 +1849,20 @@ else:
 (
     tab_run_simulation,
     tab_overview,
-    tab_performance,
-    tab_region,
-    tab_tissue,
+    tab_region_tissue_objective,
     tab_antenna,
     tab_scalability,
-    tab_slice_viewer,
-    tab_timestep_viewer,
+    tab_slice_timestep,
     tab_media,
 ) = st.tabs(
     [
-        "Run simulation",
+        "Simulation",
         "Overview",
-        "Performance",
-        "Region stats (SAR/T)",
-        "Tissue properties",
+        "Region",
         "Antenna",
         "Scalability",
-        "Slice viewer",
-        "Timestep viewer",
-        "Images & Animations",
+        "Slice",
+        "Images/Animations",
     ]
 )
 
@@ -1494,7 +1873,7 @@ with tab_run_simulation:
 with tab_overview:
     st.header("Overview")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     for i, d in enumerate(runs_data):
         if len(runs_data) > 1:
             st.subheader(d["run_id"])
@@ -1504,83 +1883,59 @@ with tab_overview:
         st.write(
             f"**Grid:** {gs[0]}×{gs[1]}×{gs[2]} | **Voxel size:** {meta.get('voxel_size_m')} m | **Time steps:** {meta.get('time_steps')}"
         )
+        st.subheader("Performance detail")
+        render_time_breakdown(
+            d["performance"], chart_key_prefix=f"overview_{d['run_id']}"
+        )
 
-with tab_performance:
-    st.header("Performance")
+with tab_region_tissue_objective:
+    st.header("Region stats, tissue properties & objective")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     for i, d in enumerate(runs_data):
         if len(runs_data) > 1:
             st.subheader(d["run_id"])
-        render_time_breakdown(d["performance"])
-
-with tab_region:
-    st.header("Region stats (SAR & temperature)")
-    if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
-    for i, d in enumerate(runs_data):
-        if len(runs_data) > 1:
-            st.subheader(d["run_id"])
-        render_region_stats(d["metadata"])
-
-with tab_tissue:
-    st.header("Tissue & dielectric properties")
-    if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
-    for i, d in enumerate(runs_data):
-        if len(runs_data) > 1:
-            st.subheader(d["run_id"])
-        render_tissue_properties(d["metadata"])
+        render_region_tissue_and_objective(
+            d["metadata"],
+            d["data_dir"],
+            d["output_base"],
+            chart_key_prefix=d["run_id"],
+        )
 
 with tab_antenna:
     st.header("Antenna parameters")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     for i, d in enumerate(runs_data):
         if len(runs_data) > 1:
             st.subheader(d["run_id"])
-        render_antenna_params(d["metadata"])
+        render_antenna_params(d["metadata"], chart_key_prefix=d["run_id"])
 
 with tab_scalability:
-    st.header("Scalability (multi-run)")
+    st.header("Scalability")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     else:
         render_scalability(runs_data)
 
-with tab_slice_viewer:
-    st.header("Slice viewer (SAR, Temperature, Segmentation)")
+with tab_slice_timestep:
+    st.header("Slice & timestep viewer")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
-    elif compare_all or len(runs_data) != 1:
-        st.caption("Select a single run in the sidebar to browse NIfTI slices.")
-    else:
-        d = runs_data[0]
-        render_slice_viewer(d["data_dir"], d["output_base"], d["run_id"])
-
-with tab_timestep_viewer:
-    st.header("Timestep viewer (time series & per-frame volumes)")
-    if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     elif compare_all or len(runs_data) != 1:
         st.caption(
-            "Select a single run in the sidebar to view time series and per-frame SAR/Temperature."
+            "Select a single run in the sidebar to browse slices, time series, and per-frame volumes."
         )
     else:
         d = runs_data[0]
-        meta = d["metadata"]
-        data_dir = d["data_dir"]
-        output_base = d["output_base"]
-        run_id = d["run_id"]
-        st.subheader("Time step vs SAR / temperature")
-        render_time_series_plots(data_dir, output_base)
-        st.subheader("Per-frame SAR & temperature (axial slice)")
-        render_timestep_viewer(data_dir, output_base, meta, run_id)
+        render_slice_and_timestep_viewer(
+            d["data_dir"], d["output_base"], d["metadata"], d["run_id"]
+        )
 
 with tab_media:
     st.header("Images & Animations")
     if not runs_data:
-        st.info("No runs yet. Use the **Run simulation** tab to create one.")
+        st.info("No runs yet. Use the **Simulation** tab to create one.")
     else:
         render_images_and_animations(runs_data)
 

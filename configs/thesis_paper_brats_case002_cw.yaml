@@ -1,0 +1,19 @@
+# Thesis — BraTS validation case 002 + CW (same protocol as case001 for fair comparison).
+
+anatomy: brain
+modalities_dir: dataset/validation_data/002
+
+max_dim: 80
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+pulse_type: cw
+pulse_amplitude: 100.0
+pulse_freq: 100000000.0
+cw_periods: 25
+
+stream_frames: true
+stream_frame_interval: 1
+skip_animations: true
+slice_timestep_images: false

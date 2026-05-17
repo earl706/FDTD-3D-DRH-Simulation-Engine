@@ -20,10 +20,12 @@ Output:
   - scalability_summary.png (all three in one figure)
 """
 
+import argparse
+import glob
 import json
 import os
 import sys
-import glob
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
@@ -311,8 +313,24 @@ def plot_summary(data, runs, out_dir, suffix=""):
 
 
 def main():
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description="Plot scalability metrics from scalability_benchmark_results.json"
+    )
+    parser.add_argument(
+        "json_path",
+        nargs="?",
+        default=None,
+        help="Path to scalability_benchmark_results.json (default: latest under results/)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        metavar="DIR",
+        help="Write PNGs here (default: directory containing the JSON)",
+    )
+    ns = parser.parse_args()
+    path = ns.json_path
+    if path is not None:
         if not os.path.isfile(path):
             print(f"File not found: {path}", file=sys.stderr)
             sys.exit(1)
@@ -324,7 +342,8 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
-    out_dir = os.path.dirname(os.path.abspath(path))
+    out_dir = ns.out_dir or os.path.dirname(os.path.abspath(path))
+    os.makedirs(out_dir, exist_ok=True)
     data, runs = load_results(path)
     print(f"Loaded {len(runs)} runs from {path}")
     print(f"Output directory: {out_dir}")

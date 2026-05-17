@@ -1,0 +1,29 @@
+# Thesis Results — 4-quadrant APA antenna optimization (maximize tumor vs healthy SAR ratio).
+# Heavy run: multiple unit FDTD solves + sweeps. Use opt_parallel: 2–4 if your machine allows.
+#
+# Run:
+#   python fdtd_brain_simulation_engine.py --config configs/thesis_paper_optimize_antenna.yaml \
+#     --modalities-dir dataset/validation_data/001
+#
+# Pure J (no P95 penalty): set opt_penalty_weight: 0 in YAML or --opt-penalty-weight 0 on CLI.
+
+anatomy: brain
+max_dim: 80
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+optimize_antenna: true
+f0: 100000000.0
+opt_time_steps: 700
+opt_phase_steps: 36
+opt_amp_steps: 9
+opt_refine_iters: 8
+opt_multi_start: 3
+opt_penalty_weight: 0.1
+opt_parallel: 1
+opt_source_scale: 1.0
+
+stream_frames: true
+stream_frame_interval: 1
+skip_animations: false

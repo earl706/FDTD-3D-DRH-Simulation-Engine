@@ -1,0 +1,23 @@
+# Thesis Results — narrowband CW / sinusoidal excitation (candidate for J > 1 vs Gaussian baseline).
+# Pipeline sets time_steps from --cw-periods and SAR accumulation window for cw/sinusoid.
+#
+# Run (add your modalities dir):
+#   python fdtd_brain_simulation_engine.py --config configs/thesis_paper_cw_sinusoid.yaml \
+#     --modalities-dir dataset/validation_data/001
+#
+# Alternatives: pulse_type: sinusoid (ramped sinusoid) or sinusoid_no_ramp
+
+anatomy: brain
+max_dim: 80
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+pulse_type: cw
+pulse_amplitude: 100.0
+pulse_freq: 100000000.0
+cw_periods: 25
+
+stream_frames: true
+stream_frame_interval: 1
+skip_animations: false

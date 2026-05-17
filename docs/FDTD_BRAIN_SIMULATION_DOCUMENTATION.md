@@ -217,7 +217,7 @@ The script uses the same **chunk size** as in the metadata (`E_frames_chunk_size
 
 ### 5.4 What it produces
 
-- **2D combined animation** — One video with 2 or 3 panels: E-field (magnitude), SAR, and (if available) temperature, all on **one slice**: the slice through the **tumor centroid (z)**. Tumor contour is overlaid. Saved as e.g. `{output_base}_efield_sar_temp_2d.mp4` or `{output_base}_sar_2d.mp4` if no temperature.
+- **2D combined animation** — One video with a **2×3** grid: row **|Ez|** and row **SAR**, columns **axial (max z)**, **sagittal (max x)**, **coronal (max y)** max projections; p99.5 scaling for both modalities; tumor contour on each panel. **Temperature is not included** in this video. Saved as `{output_base}_efield_sar_2d.mp4`.
 - **3D isometric animations** (unless you pass `--skip-3d`):
   - E-field 3D: `{output_base}_efield_3d.mp4`
   - SAR 3D: `{output_base}_sar_3d.mp4`
@@ -262,7 +262,9 @@ results/DDMMYY-HHMMSS/
 │   ├── {base}_sar.nii.gz, {base}_temperature.nii.gz
 │   └── (optional) antenna/trace/freq-sweep/geom-sweep JSONs and NPYs
 ├── images/
-│   └── {base}_*.png                  # Previews, geometry, comparisons
+│   └── {base}_*.png                  # Geometry, SAR/temp distributions, modality montages;
+│                                     # multiview: timeline15_{Ez|SAR}_*.png, unified_sar_temp_geometry_3x3.png,
+│                                     # sar_maxproj_p995_*.png, temp_maxproj_p995_*.png (per view)
 └── animations/
     └── {base}_*.mp4                  # After in-memory build or after build_animations_from_streamed_frames.py
 ```
@@ -273,12 +275,12 @@ results/DDMMYY-HHMMSS/
 
 ## 7. Quick reference: common workflows
 
-| Goal | What to run |
-|------|-----------------------------|
-| Full run from MRI folder, optimize antenna, low memory | `fdtd_brain_simulation_engine.py --modalities-dir dataset/validation_data/001 --optimize-antenna ... --max-dim 192 --stream-frames` |
-| Build videos after a streamed run | `build_animations_from_streamed_frames.py results/DDMMYY-HHMMSS` |
-| Run from existing segmentation only | `fdtd_brain_simulation_engine.py --seg brain_seg.nii --max-dim 120` |
-| Shorter/faster optimization (fewer steps) | Use smaller `--opt-phase-steps`, `--opt-amp-steps`, `--opt-multi-start`, `--opt-refine-iters` and omit or reduce `--opt-geom-zplanes` / `--opt-geom-offsets` |
+| Goal                                                   | What to run                                                                                                                                                  |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Full run from MRI folder, optimize antenna, low memory | `fdtd_brain_simulation_engine.py --modalities-dir dataset/validation_data/001 --optimize-antenna ... --max-dim 192 --stream-frames`                          |
+| Build videos after a streamed run                      | `build_animations_from_streamed_frames.py results/DDMMYY-HHMMSS`                                                                                             |
+| Run from existing segmentation only                    | `fdtd_brain_simulation_engine.py --seg brain_seg.nii --max-dim 120`                                                                                          |
+| Shorter/faster optimization (fewer steps)              | Use smaller `--opt-phase-steps`, `--opt-amp-steps`, `--opt-multi-start`, `--opt-refine-iters` and omit or reduce `--opt-geom-zplanes` / `--opt-geom-offsets` |
 
 ---
 
@@ -293,4 +295,88 @@ results/DDMMYY-HHMMSS/
 
 ---
 
-*This documentation covers `fdtd_brain_simulation_engine.py`, `brain_tumor_segmentation_model.py`, and `build_animations_from_streamed_frames.py` as of the current codebase. For exact defaults and extra options, run each script with `--help`.*
+## 9. CLI Memorization Map (complete)
+
+The buckets below include **all CLI flags in `CODE/cli.py`** and follow the same grouping/order used there.
+
+1. **Input/anatomy bucket**
+   - `--anatomy`
+   - `seg` (positional)
+   - `--modalities`
+   - `--modalities-dir`
+   - `--checkpoint`
+   - `--no-normal-brain`
+
+2. **Quadrant/APA bucket (optimized or fixed)**
+   - `--optimize-antenna`
+   - `--quadrant-fixed`
+   - `--f0`
+   - `--opt-time-steps`
+   - `--opt-phase-steps`
+   - `--opt-amp-steps`
+   - `--opt-amp-min`
+   - `--opt-amp-max`
+   - `--opt-refine-iters`
+   - `--opt-multi-start`
+   - `--opt-freq-sweep`
+   - `--opt-geom-offsets`
+   - `--opt-geom-zplanes`
+   - `--opt-penalty-weight`
+   - `--opt-parallel`
+   - `--opt-source-scale`
+   - `--fixed-quadrant-ring-offset`
+   - `--fixed-quadrant-z-plane`
+   - `--fixed-quadrant-dipole-half-len`
+   - `--fixed-quadrant-alphas`
+   - `--fixed-quadrant-phases-deg`
+
+3. **Spacing/safety bucket**
+   - `--quadrant-air-margin-cells` (local source-gap clearance)
+   - `--air-padding-cells` (global domain padding)
+
+4. **Grid/time + benchmark bucket**
+   - `--pulse-amplitude`
+   - `--time-steps`
+   - `--max-dim`
+   - `--dx-mm`
+   - `--courant-factor`
+   - `--benchmark-grid-sizes`
+   - `--benchmark-time-steps`
+   - `--benchmark-grid-sizes-range`
+
+5. **Output/animation bucket**
+   - `--stream-frames`
+   - `--no-stream-frames`
+   - `--stream-frame-interval`
+   - `--sub-sample`
+   - `--skip-animations`
+   - `--slice-timestep-images`
+
+6. **Standard-source bucket (non-optimized run)**
+   - `--pulse-type`
+   - `--prop-direction`
+   - `--source-x`
+   - `--source-y`
+   - `--source-z`
+   - `--use-source-2`
+   - `--use-source-3`
+   - `--source-x-2`
+   - `--source-y-2`
+   - `--source-z-2`
+   - `--source-x-3`
+   - `--source-y-3`
+   - `--source-z-3`
+   - `--source-ring-offset`
+   - `--pulse-freq`
+   - `--cw-periods`
+   - `--pulse-ramp-width`
+
+Memory trick:
+
+- **Local spacing** near source gaps = `--quadrant-air-margin-cells`
+- **Global spacing** around whole anatomy = `--air-padding-cells`
+- **Video density/length** = `--sub-sample` (plus `--fps` in streamed animation builder)
+
+---
+
+_This documentation covers `fdtd_brain_simulation_engine.py`, `brain_tumor_segmentation_model.py`, and `build_animations_from_streamed_frames.py` as of the current codebase. For exact defaults and extra options, run each script with `--help`._

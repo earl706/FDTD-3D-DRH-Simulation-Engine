@@ -1,0 +1,23 @@
+# Thesis Results — baseline Gaussian (broadband-style excitation; J < 1 is common).
+#
+# Run from CODE/ (or set PYTHONPATH=CODE):
+#   python fdtd_brain_simulation_engine.py --config configs/thesis_paper_gaussian_baseline.yaml \
+#     --modalities-dir dataset/validation_data/001
+#
+# Replace the modalities path with your BraTS folder (four NIfTI modalities).
+
+anatomy: brain
+max_dim: 80
+time_steps: 1000
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+pulse_type: gaussian
+pulse_amplitude: 100.0
+pulse_freq: 100000000.0
+prop_direction: '+y'
+
+stream_frames: true
+stream_frame_interval: 1
+skip_animations: false

@@ -1,0 +1,46 @@
+# Paper bundle: 4-quadrant APA optimization + final FDTD (Results chapter).
+# Expanded sweep for higher objective/J_eff exploration:
+# - broader frequency candidates
+# - geometry offsets and z-planes sweep
+# - denser phase/amp search + stronger multi-start
+# Runtime is intentionally higher for thesis-quality optimization.
+
+anatomy: brain
+max_dim: 240
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+optimize_antenna: true
+f0: 100000000.0
+# Longer unit runs so DFT snapshots are closer to steady-state for each sweep candidate.
+opt_time_steps: 900
+# Expanded frequency sweep (deep-regional hyperthermia range around the nominal 100 MHz).
+opt_freq_sweep:
+  - 70000000.0
+  - 85000000.0
+  - 100000000.0
+  - 115000000.0
+  - 130000000.0
+# Explore source-ring placement and z-plane placement around the anatomy center.
+opt_geom_offsets: [8, 10, 12, 14]
+opt_geom_zplanes: [100, 120, 140]
+# Denser controls and additional restarts to improve chances of escaping local optima.
+opt_phase_steps: 36
+opt_amp_steps: 12
+opt_amp_min: 0.15
+opt_amp_max: 3.0
+opt_refine_iters: 12
+opt_multi_start: 8
+# Optimizer maximizes J_eff = J - w * P95_healthy/mean_tumor.
+# Slightly reduced penalty still discourages healthy hotspots while allowing stronger tumor focus.
+opt_penalty_weight: 0.04
+# Keep conservative default worker count for reproducibility; raise to 2-4 on faster machines.
+opt_parallel: 4
+# Final FDTD source scale: SAR and thermal rise scale ~S^2 (J ratio unchanged).
+opt_source_scale: 1.35
+
+stream_frames: true
+stream_frame_interval: 10
+skip_animations: true
+slice_timestep_images: false

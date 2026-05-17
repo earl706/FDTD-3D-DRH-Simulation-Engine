@@ -1,0 +1,4 @@
+[console_scripts]
+hermes-build-animations = hermes_drh.visualization.animations:main
+hermes-dashboard = hermes_drh.dashboard.app:main
+hermes-simulate = hermes_drh.cli.main:main

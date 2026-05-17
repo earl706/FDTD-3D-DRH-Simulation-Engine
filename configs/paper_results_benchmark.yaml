@@ -1,0 +1,15 @@
+# Paper bundle: scalability benchmark (full pipeline per grid size, same anatomy as other runs).
+# run_paper_bundle.py passes --modalities-dir on the CLI (do not rely on a path baked in here).
+
+anatomy: brain
+
+benchmark_grid_sizes:
+  [80, 91, 102, 113, 124, 135, 146, 157, 168, 179, 190, 201, 212, 223, 234, 240, 103, 126, 149, 171]
+benchmark_time_steps: 500
+
+max_dim: 120
+dx_mm: 10.0
+courant_factor: 0.99
+
+skip_animations: true
+stream_frames: false

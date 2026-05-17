@@ -1,0 +1,17 @@
+# Paper bundle: CW sinusoidal excitation (Results chapter).
+
+anatomy: brain
+max_dim: 80
+dx_mm: 10.0
+courant_factor: 0.99
+air_padding_cells: 10
+
+pulse_type: cw
+pulse_amplitude: 100.0
+pulse_freq: 100000000.0
+cw_periods: 25
+
+stream_frames: true
+stream_frame_interval: 10
+skip_animations: true
+slice_timestep_images: false

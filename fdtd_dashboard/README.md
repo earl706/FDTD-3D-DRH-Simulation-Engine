@@ -32,22 +32,28 @@ streamlit run streamlit_app.py
 
 Then open the URL shown (e.g. http://localhost:8501).
 
-## Features
+## Tabs (main UI)
 
-- **Run selection**: Pick a run from `results/{timestamp}/data/` (metadata and performance JSON).
-- **Compare all**: Load all runs and show scalability (wall time and memory vs voxels).
-- **Overview**: KPIs (total time, time/step, voxels, peak memory) and grid info.
-- **Performance**: Time breakdown (FDTD, SAR, thermal) as pie and bar charts.
-- **Region stats**: SAR and temperature min/max/mean for tumor vs non-tumor.
-- **Antenna**: Optimized frequency, amplitudes, and phases when antenna optimization was used.
-- **Scalability**: Scatter plots of wall time and peak memory vs voxels across runs.
-- **Data preview**: Optional NIfTI slice view for SAR and temperature (if files exist).
+| Tab | Purpose |
+|-----|---------|
+| **Simulation** | Upload MRI / set CLI-style parameters / run the engine locally or download a package for the local runner. |
+| **Overview** | KPIs (total time, time per FDTD step, voxels, peak memory, animation time), grid metadata, and pipeline phase charts (pie/bar). |
+| **Region** | Region statistics (SAR and temperature in tumor vs non-tumor), tissue properties from metadata, and objective \(J\) when available. |
+| **Antenna** | Four-quadrant APA metadata: optimized or fixed amplitudes/phases and carrier frequency when applicable. |
+| **Scalability** | **Multiple runs:** scatter plots of wall time and peak memory vs voxels (use sidebar **Compare all runs**). **Single run:** same-style performance summary (KPIs + phase breakdown) until more runs exist. |
+| **Slice** | Single-run slice viewer, time series, and per-frame SAR/temperature (disabled when comparing all runs). |
+| **Images/Animations** | PNGs under `images/` and MP4s under `animations/` for the loaded run(s). |
+
+## Sidebar
+
+- **Run selection:** choose one run from `results/{timestamp}/data/`, or enable **Compare all runs (scalability)** to load every run.
+- **Data preview:** optional NIfTI slice preview when a single run is selected.
 
 ## Run simulation on your machine (no server compute)
 
 When the app is deployed (e.g. Streamlit Cloud), you can run the FDTD simulation on your own PC so the server does not run the engine:
 
-1. In the **Run simulation** tab, choose **"My machine (local runner)"**.
+1. In the **Simulation** tab, choose **"My machine (local runner)"**.
 2. Configure inputs and parameters as usual, then click **Run simulation**.
 3. Download the **run package (ZIP)** and the **Run page (HTML)**.
 4. On your PC, from the repo root: `python fdtd_dashboard/local_runner.py`
@@ -62,6 +68,6 @@ The app expects:
 
 - `results/{timestamp}/data/{base}_metadata.json`
 - `results/{timestamp}/data/{base}_performance.json`
-- Optional: `{base}_SAR.nii.gz`, `{base}_temperature.nii.gz`
+- Optional: `{base}_SAR.nii.gz`, `{base}_temperature.nii.gz`, `{base}_segmentation.nii.gz`, frames under `data/SAR_frames/`, etc.
 
 These are produced by `fdtd_brain_simulation_engine.py` in the parent directory.

@@ -1,0 +1,100 @@
+Metadata-Version: 2.4
+Name: hermes-drh
+Version: 0.1.0
+Summary: HERMES: patient-specific 3D FDTD DRH simulation (MRI voxels, SAR, thermal, antenna optimization)
+Author: HERMES DRH Team
+License: MIT
+Project-URL: Homepage, https://github.com/hermes-drh/hermes-drh
+Project-URL: Documentation, https://github.com/hermes-drh/hermes-drh#readme
+Project-URL: Repository, https://github.com/hermes-drh/hermes-drh
+Keywords: fdtd,hyperthermia,sar,mri,brain,simulation
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering :: Medical Science Apps.
+Requires-Python: <3.14,>=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy<3,>=1.26
+Requires-Dist: scipy>=1.11
+Requires-Dist: numba>=0.59
+Requires-Dist: nibabel>=5.2
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: tqdm>=4.66
+Provides-Extra: segmentation
+Requires-Dist: torch<2.11,>=2.2; extra == "segmentation"
+Requires-Dist: monai>=1.3; extra == "segmentation"
+Provides-Extra: dashboard
+Requires-Dist: streamlit>=1.30; extra == "dashboard"
+Provides-Extra: all
+Requires-Dist: torch<2.11,>=2.2; extra == "all"
+Requires-Dist: monai>=1.3; extra == "all"
+Requires-Dist: streamlit>=1.30; extra == "all"
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-cov>=4; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+Requires-Dist: black>=24; extra == "dev"
+Requires-Dist: build>=1.2; extra == "dev"
+Requires-Dist: twine>=5; extra == "dev"
+Dynamic: license-file
+
+# hermes-drh
+
+**HERMES** (Hyperthermia Electromagnetic and Robust Modeling Evaluation Suite) is a Python framework for patient-specific deep regional hyperthermia (DRH) research: MRI-derived voxel models, 3D FDTD electromagnetic simulation, SAR and simplified thermal post-processing, optional four-quadrant antenna optimization, and visualization.
+
+## Install
+
+From the `CODE/` directory (development):
+
+```bash
+pip install -e ".[dev]"
+```
+
+End users (PyPI, when published):
+
+```bash
+pip install hermes-drh
+pip install "hermes-drh[segmentation]"   # BraTS 3D U-Net path (PyTorch + MONAI)
+pip install "hermes-drh[all]"            # segmentation + Streamlit dashboard
+```
+
+Requires **Python 3.11–3.13**. For MP4 animations, install **ffmpeg** on your system.
+
+## Quickstart
+
+```bash
+# From existing segmentation NIfTI
+hermes-simulate --seg path/to/labels.nii.gz
+
+# BraTS-style modalities folder
+hermes-simulate --modalities-dir path/to/001
+
+# YAML defaults (bundled example config)
+hermes-simulate --config "$(python -c "from importlib.resources import files; print(files('hermes_drh').joinpath('configs/simulation_example.yaml'))")" --modalities-dir path/to/001
+
+# Build MP4s from a completed streamed run
+hermes-build-animations results/your_run_dir --skip-3d
+```
+
+Set `HERMES_CHECKPOINT=/path/to/best_model.pth` when using `--modalities` / `--modalities-dir` without passing `--checkpoint`.
+
+## Dashboard
+
+```bash
+pip install "hermes-drh[dashboard]"
+hermes-dashboard
+```
+
+## Thesis paper bundle (not in this package)
+
+LaTeX figure generation and `run_paper_bundle.py` live in the thesis repository only; they are **not** installed from PyPI.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

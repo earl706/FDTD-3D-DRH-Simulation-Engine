@@ -9,11 +9,12 @@ __pycache__/
 # CODE outputs and data
 checkpoint_epoch_8.pth
 results/
+paper_bundle_runs/
 dataset/
 cervical_dataset/
 BC_MRI_SEG/
 3D_FDTD_D
-fdtd_equations_reference.tex
+fdtd_equations_reference/
 
 # Env and OS
 .env
